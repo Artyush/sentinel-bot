@@ -1,23 +1,17 @@
 # Sentinel Bot
 
-A self-hosted Telegram bot for website availability and Linux server monitoring. The intended first release checks configured sources, confirms incidents, and delivers alerts without requiring an application database or a monitoring cluster.
+Sentinel Bot is a self-hosted Telegram monitoring bot project for websites and Linux servers. Its purpose is to give operators a clear view of website availability and server resource usage, with technical alerts about problems and recovery.
 
-**Status: project planning, 14 October 2026.** The application, Docker image, Compose configuration, and executable tests have not been implemented. Features below describe the target release.
+The project's functional scope includes:
 
-## Planned first release
+- HTTP(S) availability checks with timeouts, TLS verification, response latency, and optional content validation.
+- Linux CPU, memory, uptime, and configured filesystem metrics from Node Exporter endpoints.
+- Confirmed outage and resource-threshold alerts, recovery notifications, and reminders for ongoing incidents.
+- Telegram status commands for websites and servers, available in a configured group or private chat.
+- Access restrictions through an allowed-user list and an optional group topic.
+- Persistent monitoring state and a notification queue with retries during delivery failures.
+- Docker Compose execution with a dedicated state volume.
 
-- Independent HTTP checks with timeouts, TLS verification, latency, and optional content markers.
-- Linux CPU, memory, and configured filesystem metrics from existing Node Exporter endpoints.
-- Confirmed outage and recovery alerts, reminders, and persistent delivery retries.
-- Telegram `/help`, `/status`, `/sites`, `/servers`, and `/server <alias>` commands restricted to a configured destination and user allowlist.
-- SQLite state, a Docker runtime, and an offline Compose demo using synthetic sources and a fake Telegram transport.
+The command interface consists of `/help`, `/status`, `/sites`, `/servers`, and `/server <alias>`. Status reports distinguish confirmed incidents from current readings and identify unknown or stale data.
 
-The bot reads configured sources and writes only its own monitoring state. Server endpoints are provisioned separately; the bot does not run commands or manage services on monitored machines.
-
-## Design direction
-
-Python, asyncio, aiohttp, aiogram, and SQLite in one process. Server metrics come from a Node Exporter adapter; no Prometheus server is required for this design. Dependency versions will be verified and locked during implementation.
-
-The repository and its future demo will be self-contained. Examples and tests will use synthetic data.
-
-Verified setup commands and demo instructions will be added with the implementation. A license has not been selected.
+Monitoring is read-only and limited to explicitly configured sources. Server exporter endpoints are provisioned separately. The project is independent of business applications and their databases.
