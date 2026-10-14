@@ -20,3 +20,5 @@ The command interface consists of `/help`, `/status`, `/sites`, `/servers`, and 
 Sources can use polling, event submission, or both. Attack detection belongs to the sending server or service; Sentinel receives its report and routes notifications. Silence from a push-only source does not establish that the source is healthy.
 
 Monitoring is read-only and limited to explicitly configured sources. Server exporter endpoints are provisioned separately. The project is independent of business applications and their databases.
+
+[Docker setup and local email testing](docs/running.md)
