@@ -1,0 +1,14 @@
+**
+!Dockerfile
+!pyproject.toml
+!README.md
+!requirements-build.lock
+!requirements.lock
+!src/
+!src/**
+!config/
+!config/idle.toml
+src/**/__pycache__/
+src/**/*.pyc
+src/**/*.pyo
+src/**/*.egg-info/

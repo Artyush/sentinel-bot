@@ -1,0 +1,36 @@
+services:
+  sentinel:
+    container_name: "${COMPOSE_PROJECT_NAME}-sentinel"
+    build: .
+    image: sentinel-bot:local
+    user: "10001:10001"
+    read_only: true
+    restart: unless-stopped
+    stop_grace_period: 15s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.5
+    environment:
+      SENTINEL_CONFIG: /app/config.toml
+      SENTINEL_STATE_DIR: /var/lib/sentinel
+    volumes:
+      - sentinel-state:/var/lib/sentinel
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,uid=10001,gid=10001,mode=1770
+    networks:
+      - sentinel
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  sentinel-state:
+
+networks:
+  sentinel:
