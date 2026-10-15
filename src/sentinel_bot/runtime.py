@@ -16,6 +16,7 @@ from sentinel_bot.config import Settings
 from sentinel_bot.monitoring import MonitoringProgress, monitor_sites
 from sentinel_bot.policy import is_fresh
 from sentinel_bot.storage import SQLiteStore, initialize_state
+from sentinel_bot.workers import await_completion
 from sentinel_bot.workers import run_blocking as _blocking
 
 LOCK_NAME = "instance.lock"
@@ -72,6 +73,8 @@ def _write_heartbeat(
     if progress is not None:
         heartbeat["workers"] = progress.workers.copy()
         heartbeat["observations"] = progress.observations.copy()
+        if progress.telegram:
+            heartbeat["telegram"] = progress.telegram.copy()
     encoded = json.dumps(heartbeat).encode()
     if len(encoded) > MAX_HEALTH_BYTES:
         raise RuntimeError("Local health record exceeds its size bound")
@@ -102,6 +105,16 @@ async def _heartbeat(
             pass
 
 
+async def _shutdown(
+    workers: list[asyncio.Task[None]], stop_waiter: asyncio.Task[bool], timeout: float
+) -> list[BaseException | None]:
+    stop_waiter.cancel()
+    await asyncio.gather(stop_waiter, return_exceptions=True)
+    for worker in workers:
+        worker.cancel()
+    return await asyncio.wait_for(asyncio.gather(*workers, return_exceptions=True), timeout=timeout)
+
+
 async def run(settings: Settings) -> None:
     """Run validated workers until a stop signal, cancellation, or visible failure."""
     if settings.mode not in {"idle", "monitor", "demo"}:
@@ -120,17 +133,38 @@ async def run(settings: Settings) -> None:
             (settings.state_dir / HEALTH_NAME).unlink(missing_ok=True)
             await _blocking(lambda: initialize_state(settings.state_dir, datetime.now(UTC)))
             store = SQLiteStore(settings.state_dir)
+            await _blocking(
+                lambda: store.configure_telegram(
+                    None if settings.telegram is None else settings.telegram.destination,
+                    datetime.now(UTC),
+                )
+            )
             await _blocking(lambda: store.reconcile(settings.sites))
+            state_lock = asyncio.Lock()
             progress = None
-            if settings.mode != "idle":
+            if settings.mode != "idle" or settings.telegram is not None:
                 progress = MonitoringProgress(
                     workers={
                         site.alias: time.monotonic() for site in settings.sites if site.enabled
                     }
                 )
+                if settings.telegram is not None:
+                    from sentinel_bot.telegram_runtime import WORKER_NAMES
+
+                    progress.telegram = {name: time.monotonic() for name in WORKER_NAMES}
             workers = [asyncio.create_task(_heartbeat(settings, guard.run_id, stopped, progress))]
-            if progress is not None:
-                workers.append(asyncio.create_task(monitor_sites(settings, stopped, progress)))
+            if progress is not None and settings.mode != "idle":
+                workers.append(
+                    asyncio.create_task(
+                        monitor_sites(settings, stopped, progress, state_lock=state_lock)
+                    )
+                )
+            if progress is not None and settings.telegram is not None:
+                from sentinel_bot.telegram_runtime import run_telegram
+
+                workers.append(
+                    asyncio.create_task(run_telegram(settings, stopped, progress, state_lock))
+                )
             stop_waiter = asyncio.create_task(stopped.wait())
             try:
                 done, _ = await asyncio.wait(
@@ -143,13 +177,8 @@ async def run(settings: Settings) -> None:
                             raise RuntimeError("Runtime worker stopped unexpectedly")
             finally:
                 stopped.set()
-                stop_waiter.cancel()
-                await asyncio.gather(stop_waiter, return_exceptions=True)
-                for worker in workers:
-                    worker.cancel()
-                results = await asyncio.wait_for(
-                    asyncio.gather(*workers, return_exceptions=True),
-                    timeout=settings.shutdown_timeout,
+                results = await await_completion(
+                    asyncio.create_task(_shutdown(workers, stop_waiter, settings.shutdown_timeout))
                 )
                 for result in results:
                     if isinstance(result, BaseException) and not isinstance(
@@ -239,6 +268,18 @@ def _current_heartbeat(
                 if check_workers and not is_fresh(
                     value, time.monotonic(), 2 * site.poll_interval + 2 * site.total_timeout
                 ):
+                    return None
+        if settings.telegram is not None:
+            from sentinel_bot.telegram_runtime import WORKER_NAMES, WORKER_TIMEOUT
+
+            channel = heartbeat.get("telegram")
+            if not isinstance(channel, dict) or set(channel) != WORKER_NAMES:
+                return None
+            for name in WORKER_NAMES:
+                value = channel[name]
+                if type(value) not in (float, int) or not isinstance(value, (float, int)):
+                    return None
+                if check_workers and not is_fresh(value, time.monotonic(), WORKER_TIMEOUT):
                     return None
         if not _lock_is_held(fd) or _read_record(settings.state_dir / LOCK_NAME) != owner:
             return None

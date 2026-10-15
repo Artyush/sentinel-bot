@@ -55,4 +55,9 @@ def status_snapshot(settings: Settings) -> dict[str, object]:
                 },
             }
         )
-    return {"mode": settings.mode, "sites": sites, "pending_notifications": store.pending_count()}
+    return {
+        "mode": settings.mode,
+        "sites": sites,
+        "pending_notifications": store.pending_count(),
+        "telegram": {"enabled": settings.telegram is not None, **store.delivery_status()},
+    }
