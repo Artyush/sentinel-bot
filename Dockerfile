@@ -25,7 +25,7 @@ RUN groupadd --gid 10001 sentinel \
 
 COPY --from=builder /opt/application/ /opt/application/
 COPY config/idle.toml /app/config.toml
-COPY config/idle.toml config/demo.toml config/sites.example.toml /app/config/
+COPY config/idle.toml config/demo.toml config/sites.example.toml config/telegram.example.toml /app/config/
 COPY demo/site_fixture.py /app/demo/site_fixture.py
 
 USER 10001:10001

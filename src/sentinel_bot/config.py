@@ -10,7 +10,7 @@ import os
 import re
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -59,6 +59,20 @@ class SiteConfig:
 
 
 @dataclass(frozen=True)
+class TelegramSettings:
+    """One fixed destination and its allowed command users; credentials stay private."""
+
+    token: str = field(repr=False)
+    chat_id: int = field(repr=False)
+    allowed_user_ids: frozenset[int] = field(repr=False)
+    topic_id: int | None = field(default=None, repr=False)
+
+    @property
+    def destination(self) -> str:
+        return f"telegram:{self.chat_id}:{self.topic_id or 0}"
+
+
+@dataclass(frozen=True)
 class Settings:
     state_dir: Path
     mode: str = "idle"
@@ -67,6 +81,7 @@ class Settings:
     shutdown_timeout: float = 5.0
     sites: tuple[SiteConfig, ...] = ()
     max_concurrency: int = 5
+    telegram: TelegramSettings | None = field(default=None, repr=False)
 
 
 def _duration(value: object, field: str, lower: float, upper: float) -> float:
@@ -201,6 +216,52 @@ def _site(value: object, mode: str) -> SiteConfig:
     )
 
 
+def _telegram(value: object, environ: Mapping[str, str], mode: str) -> TelegramSettings | None:
+    if not isinstance(value, dict) or set(value) - {"enabled"}:
+        raise ConfigError("Only the enabled flag is supported in [telegram].")
+    enabled = value.get("enabled", False)
+    if type(enabled) is not bool:
+        raise ConfigError("telegram.enabled must be a boolean.")
+    if not enabled:
+        return None
+    if mode == "demo":
+        raise ConfigError("The isolated website demo cannot enable live Telegram.")
+    token = environ.get("SENTINEL_TELEGRAM_BOT_TOKEN", "")
+    if not re.fullmatch(r"[1-9][0-9]{0,19}:[A-Za-z0-9_-]{20,128}", token):
+        raise ConfigError("Telegram requires a valid bot token environment variable.")
+
+    def identifier(name: str, *, negative: bool = False) -> int:
+        raw = environ.get(name, "")
+        pattern = r"-?[1-9][0-9]{0,15}" if negative else r"[1-9][0-9]{0,15}"
+        if not re.fullmatch(pattern, raw):
+            raise ConfigError(
+                "Telegram destination and user IDs must be numeric environment values."
+            )
+        number = int(raw)
+        if abs(number) >= 2**52:
+            raise ConfigError("Telegram identifier is outside the supported range.")
+        return number
+
+    chat_id = identifier("SENTINEL_TELEGRAM_CHAT_ID", negative=True)
+    raw_users = environ.get("SENTINEL_TELEGRAM_ALLOWED_USER_IDS", "")
+    if not raw_users or len(raw_users) > 400:
+        raise ConfigError("Telegram requires an explicit allowlist of at most 20 users.")
+    parts = raw_users.split(",")
+    if len(parts) > 20 or any(
+        not re.fullmatch(r"[1-9][0-9]{0,15}", part.strip()) for part in parts
+    ):
+        raise ConfigError("Telegram requires an explicit numeric user allowlist.")
+    users = frozenset(int(part.strip()) for part in parts)
+    if len(users) != len(parts) or any(user >= 2**52 for user in users):
+        raise ConfigError("Telegram user identifiers must be unique and bounded.")
+    topic_id = None
+    if environ.get("SENTINEL_TELEGRAM_TOPIC_ID", ""):
+        topic_id = identifier("SENTINEL_TELEGRAM_TOPIC_ID")
+        if topic_id > 2**31 - 1 or chat_id > 0:
+            raise ConfigError("Telegram topics require a group chat and a bounded topic ID.")
+    return TelegramSettings(token, chat_id, users, topic_id)
+
+
 def load_settings(path: Path, environ: Mapping[str, str] | None = None) -> Settings:
     """Read a bounded TOML file without probing sources or creating state."""
     try:
@@ -217,10 +278,10 @@ def load_settings(path: Path, environ: Mapping[str, str] | None = None) -> Setti
 
     if (
         "runtime" not in document
-        or set(document) - {"runtime", "sites"}
+        or set(document) - {"runtime", "sites", "telegram"}
         or not isinstance(document["runtime"], dict)
     ):
-        raise ConfigError("Only [runtime] and [[sites]] configuration sections are supported.")
+        raise ConfigError("Only [runtime], [[sites]], and [telegram] sections are supported.")
     runtime: dict[str, object] = document["runtime"]
     allowed = {
         "mode",
@@ -248,6 +309,7 @@ def load_settings(path: Path, environ: Mapping[str, str] | None = None) -> Setti
         raise ConfigError("Monitoring mode requires at least one enabled site.")
 
     env = os.environ if environ is None else environ
+    telegram = _telegram(document.get("telegram", {}), env, mode)
     state_value = env.get("SENTINEL_STATE_DIR", runtime.get("state_dir", "data"))
     if (
         not isinstance(state_value, str)
@@ -285,5 +347,5 @@ def load_settings(path: Path, environ: Mapping[str, str] | None = None) -> Setti
     )
     concurrency = _integer(runtime.get("max_concurrency", 5), "max_concurrency", 1, 5)
     return Settings(
-        state_dir, mode, heartbeat, health_timeout, shutdown_timeout, sites, concurrency
+        state_dir, mode, heartbeat, health_timeout, shutdown_timeout, sites, concurrency, telegram
     )

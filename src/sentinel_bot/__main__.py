@@ -14,6 +14,7 @@ from sentinel_bot.email import EmailError, send_test_email
 from sentinel_bot.runtime import InstanceError, healthcheck, run
 from sentinel_bot.status import status_snapshot
 from sentinel_bot.storage import StorageError
+from sentinel_bot.telegram_runtime import TelegramConfigurationError
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -59,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         asyncio.run(run(settings))
-    except (InstanceError, StorageError) as exc:
+    except (InstanceError, StorageError, TelegramConfigurationError) as exc:
         print(f"Runtime error: {exc}", file=sys.stderr)
         return 1
     except OSError:
