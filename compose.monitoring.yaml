@@ -1,0 +1,47 @@
+services:
+  sentinel:
+    environment:
+      SENTINEL_CONFIG: /app/config/demo.toml
+    depends_on:
+      site-fixture:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "sentinel_bot", "healthcheck"]
+      interval: 1s
+      timeout: 3s
+      start_period: 1s
+      retries: 3
+
+  site-fixture:
+    container_name: "${COMPOSE_PROJECT_NAME}-site-fixture"
+    image: sentinel-bot:local
+    entrypoint: ["python", "/app/demo/site_fixture.py"]
+    command: []
+    user: "10001:10001"
+    read_only: true
+    restart: unless-stopped
+    stop_grace_period: 5s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 32
+    mem_limit: 64m
+    cpus: 0.25
+    networks:
+      - sentinel
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=1).close()"]
+      interval: 1s
+      timeout: 3s
+      start_period: 1s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "2"
+
+networks:
+  sentinel:
+    internal: true

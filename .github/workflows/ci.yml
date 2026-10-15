@@ -34,3 +34,5 @@ jobs:
         run: pytest --cov=sentinel_bot --cov-report=term-missing
       - name: Docker foundation smoke check
         run: python scripts/docker_smoke.py
+      - name: Docker website monitoring smoke check
+        run: python scripts/monitoring_smoke.py

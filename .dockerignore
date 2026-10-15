@@ -8,6 +8,10 @@
 !src/**
 !config/
 !config/idle.toml
+!config/demo.toml
+!config/sites.example.toml
+!demo/
+!demo/site_fixture.py
 src/**/__pycache__/
 src/**/*.pyc
 src/**/*.pyo

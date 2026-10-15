@@ -1,4 +1,4 @@
-"""Single-instance idle lifecycle and local progress health checks."""
+"""Single-instance lifecycle and local worker progress health checks."""
 
 import asyncio
 import fcntl
@@ -8,13 +8,15 @@ import os
 import signal
 import tempfile
 import time
-from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
 from sentinel_bot.config import Settings
-from sentinel_bot.storage import initialize_state
+from sentinel_bot.monitoring import MonitoringProgress, monitor_sites
+from sentinel_bot.policy import is_fresh
+from sentinel_bot.storage import SQLiteStore, initialize_state
+from sentinel_bot.workers import run_blocking as _blocking
 
 LOCK_NAME = "instance.lock"
 HEALTH_NAME = "health.json"
@@ -54,41 +56,45 @@ class _InstanceGuard:
             self.fd = None
 
 
-def _write_heartbeat(state_dir: Path, run_id: str) -> None:
-    heartbeat = {
+def _write_heartbeat(
+    state_dir: Path,
+    run_id: str,
+    settings: Settings | None = None,
+    progress: MonitoringProgress | None = None,
+) -> None:
+    heartbeat: dict[str, object] = {
         "run_id": run_id,
         "pid": os.getpid(),
         "progress_monotonic": time.monotonic(),
         "updated_at": datetime.now(UTC).isoformat(),
-        "status": "idle",
+        "status": "idle" if settings is None else settings.mode,
     }
+    if progress is not None:
+        heartbeat["workers"] = progress.workers.copy()
+        heartbeat["observations"] = progress.observations.copy()
+    encoded = json.dumps(heartbeat).encode()
+    if len(encoded) > MAX_HEALTH_BYTES:
+        raise RuntimeError("Local health record exceeds its size bound")
     fd, temporary = tempfile.mkstemp(prefix=".health-", dir=state_dir)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(heartbeat, stream)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(encoded)
         os.replace(temporary, state_dir / HEALTH_NAME)
     finally:
         Path(temporary).unlink(missing_ok=True)
 
 
-async def _blocking[Result](operation: Callable[[], Result]) -> Result:
-    task = asyncio.create_task(asyncio.to_thread(operation))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # A cancelled await cannot stop a SQLite thread; keep the lock until it exits.
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                continue
-        task.result()
-        raise
-
-
-async def _heartbeat(settings: Settings, run_id: str, stopped: asyncio.Event) -> None:
+async def _heartbeat(
+    settings: Settings,
+    run_id: str,
+    stopped: asyncio.Event,
+    progress: MonitoringProgress | None = None,
+) -> None:
     while not stopped.is_set():
-        _write_heartbeat(settings.state_dir, run_id)
+        if progress is None:
+            _write_heartbeat(settings.state_dir, run_id)
+        else:
+            _write_heartbeat(settings.state_dir, run_id, settings, progress)
         try:
             async with asyncio.timeout(settings.heartbeat_interval):
                 await stopped.wait()
@@ -97,9 +103,9 @@ async def _heartbeat(settings: Settings, run_id: str, stopped: asyncio.Event) ->
 
 
 async def run(settings: Settings) -> None:
-    """Run explicit idle mode until a stop signal, cancellation, or worker failure."""
-    if settings.mode != "idle":
-        raise RuntimeError("Only explicit idle mode is implemented")
+    """Run validated workers until a stop signal, cancellation, or visible failure."""
+    if settings.mode not in {"idle", "monitor", "demo"}:
+        raise RuntimeError("Unsupported runtime mode")
     with _InstanceGuard(settings.state_dir) as guard:
         stopped = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -113,21 +119,43 @@ async def run(settings: Settings) -> None:
                 installed.append(signum)
             (settings.state_dir / HEALTH_NAME).unlink(missing_ok=True)
             await _blocking(lambda: initialize_state(settings.state_dir, datetime.now(UTC)))
-            worker = asyncio.create_task(_heartbeat(settings, guard.run_id, stopped))
+            store = SQLiteStore(settings.state_dir)
+            await _blocking(lambda: store.reconcile(settings.sites))
+            progress = None
+            if settings.mode != "idle":
+                progress = MonitoringProgress(
+                    workers={
+                        site.alias: time.monotonic() for site in settings.sites if site.enabled
+                    }
+                )
+            workers = [asyncio.create_task(_heartbeat(settings, guard.run_id, stopped, progress))]
+            if progress is not None:
+                workers.append(asyncio.create_task(monitor_sites(settings, stopped, progress)))
             stop_waiter = asyncio.create_task(stopped.wait())
             try:
                 done, _ = await asyncio.wait(
-                    {worker, stop_waiter}, return_when=asyncio.FIRST_COMPLETED
+                    {*workers, stop_waiter}, return_when=asyncio.FIRST_COMPLETED
                 )
-                if worker in done:
-                    await worker
-                    if not stopped.is_set():
-                        raise RuntimeError("Heartbeat worker stopped unexpectedly")
+                for worker in workers:
+                    if worker in done:
+                        await worker
+                        if not stopped.is_set():
+                            raise RuntimeError("Runtime worker stopped unexpectedly")
             finally:
                 stopped.set()
                 stop_waiter.cancel()
                 await asyncio.gather(stop_waiter, return_exceptions=True)
-                await asyncio.wait_for(worker, timeout=settings.shutdown_timeout)
+                for worker in workers:
+                    worker.cancel()
+                results = await asyncio.wait_for(
+                    asyncio.gather(*workers, return_exceptions=True),
+                    timeout=settings.shutdown_timeout,
+                )
+                for result in results:
+                    if isinstance(result, BaseException) and not isinstance(
+                        result, asyncio.CancelledError
+                    ):
+                        raise result
         finally:
             try:
                 (settings.state_dir / HEALTH_NAME).unlink(missing_ok=True)
@@ -160,43 +188,86 @@ def _lock_is_held(fd: int) -> bool:
     return False
 
 
-def healthcheck(settings: Settings) -> bool:
-    """Check current lock ownership and recent idle-loop progress without networking."""
+def _current_heartbeat(
+    settings: Settings, *, check_workers: bool = True
+) -> dict[str, object] | None:
+    """Read only a bounded heartbeat owned by the current, progressing process."""
     fd: int | None = None
     try:
         fd = os.open(settings.state_dir / LOCK_NAME, os.O_RDWR)
         if not _lock_is_held(fd):
-            return False
+            return None
         owner = _read_record(settings.state_dir / LOCK_NAME)
         heartbeat = _read_record(settings.state_dir / HEALTH_NAME)
         run_id = owner.get("run_id")
         pid = owner.get("pid")
         if not isinstance(run_id, str) or len(run_id) != 32:
-            return False
+            return None
         UUID(hex=run_id)
         if type(pid) is not int or pid <= 0:
-            return False
+            return None
         if heartbeat.get("run_id") != run_id or heartbeat.get("pid") != pid:
-            return False
-        if type(heartbeat.get("pid")) is not int or heartbeat.get("status") != "idle":
-            return False
+            return None
+        if type(heartbeat.get("pid")) is not int or heartbeat.get("status") != settings.mode:
+            return None
         progress = heartbeat.get("progress_monotonic")
         if type(progress) not in (float, int):
-            return False
+            return None
         if not isinstance(progress, (float, int)) or not math.isfinite(progress):
-            return False
+            return None
         age = time.monotonic() - progress
         if not 0 <= age <= settings.health_timeout:
-            return False
+            return None
         updated_at = heartbeat.get("updated_at")
         if not isinstance(updated_at, str):
-            return False
+            return None
         timestamp = datetime.fromisoformat(updated_at)
         if timestamp.tzinfo is None or timestamp.utcoffset() != UTC.utcoffset(timestamp):
-            return False
-        return _lock_is_held(fd) and _read_record(settings.state_dir / LOCK_NAME) == owner
+            return None
+        if settings.mode != "idle":
+            workers = heartbeat.get("workers")
+            if not isinstance(workers, dict) or set(workers) != {
+                s.alias for s in settings.sites if s.enabled
+            }:
+                return None
+            for site in settings.sites:
+                if not site.enabled:
+                    continue
+                value = workers.get(site.alias)
+                if type(value) not in (int, float) or not isinstance(value, (int, float)):
+                    return None
+                if check_workers and not is_fresh(
+                    value, time.monotonic(), 2 * site.poll_interval + 2 * site.total_timeout
+                ):
+                    return None
+        if not _lock_is_held(fd) or _read_record(settings.state_dir / LOCK_NAME) != owner:
+            return None
+        return heartbeat
     except OSError, ValueError, TypeError, OverflowError:
-        return False
+        return None
     finally:
         if fd is not None:
             os.close(fd)
+
+
+def healthcheck(settings: Settings) -> bool:
+    """Check current ownership and worker progress, independently of website health."""
+    return _current_heartbeat(settings) is not None
+
+
+def observation_progress(settings: Settings) -> dict[str, float]:
+    """Read current-run times independently of a different source's stalled worker."""
+    heartbeat = _current_heartbeat(settings, check_workers=False)
+    if heartbeat is None:
+        return {}
+    values = heartbeat.get("observations")
+    if not isinstance(values, dict):
+        return {}
+    return {
+        site.alias: float(value)
+        for site in settings.sites
+        if site.enabled
+        if type(value := values.get(site.alias)) in (int, float)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+    }

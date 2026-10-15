@@ -1,5 +1,7 @@
 # Exact versions and SHA-256 hashes from official PyPI release metadata.
 # Install with: python -m pip install --require-hashes -r requirements-dev.lock
+-r requirements.lock
+
 ast-serialize==0.13.0 \
     --hash=sha256:017ddd4f22e727ef93e66df2d53340a6ff809b7e34cc2218f67918ae6239aad0 \
     --hash=sha256:12441bc7e41e495db5634c98adc8f8886b619ce2f1e68effe3f792a2adca9f47 \

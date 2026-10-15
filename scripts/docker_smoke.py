@@ -17,7 +17,11 @@ def command(*args: str, expected: int = 0, timeout: float = 120) -> str:
     result = subprocess.run(
         args,
         cwd=ROOT,
-        env={**os.environ, "MAILPIT_HTTP_PORT": "0"},
+        env={
+            **os.environ,
+            "MAILPIT_HTTP_PORT": "0",
+            "SENTINEL_CONTAINER_CONFIG": "/app/config.toml",
+        },
         capture_output=True,
         text=True,
         timeout=timeout,
