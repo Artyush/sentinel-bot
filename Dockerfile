@@ -4,7 +4,8 @@ WORKDIR /build
 COPY requirements-build.lock requirements.lock pyproject.toml README.md ./
 COPY src/ ./src/
 RUN python -m pip install --no-cache-dir --require-hashes -r requirements-build.lock \
-    && python -m pip install --no-cache-dir --require-hashes -r requirements.lock \
+    && python -m pip install --no-cache-dir --no-compile --require-hashes \
+        --target /opt/application -r requirements.lock \
     && python -m pip install --no-cache-dir --no-compile --no-deps --no-build-isolation \
         --target /opt/application .
 
@@ -24,6 +25,8 @@ RUN groupadd --gid 10001 sentinel \
 
 COPY --from=builder /opt/application/ /opt/application/
 COPY config/idle.toml /app/config.toml
+COPY config/idle.toml config/demo.toml config/sites.example.toml /app/config/
+COPY demo/site_fixture.py /app/demo/site_fixture.py
 
 USER 10001:10001
 WORKDIR /app

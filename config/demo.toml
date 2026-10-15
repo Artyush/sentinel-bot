@@ -1,0 +1,27 @@
+[runtime]
+mode = "demo"
+state_dir = "data"
+heartbeat_interval_seconds = 0.2
+health_timeout_seconds = 2
+shutdown_timeout_seconds = 2
+max_concurrency = 2
+
+[[sites]]
+alias = "primary"
+url = "http://site-fixture:8080/primary"
+marker = "READY"
+poll_interval_seconds = 0.2
+connect_timeout_seconds = 0.2
+total_timeout_seconds = 2
+failure_confirmation = 3
+recovery_confirmation = 2
+
+[[sites]]
+alias = "secondary"
+url = "http://site-fixture:8080/secondary"
+marker = "READY"
+poll_interval_seconds = 0.5
+connect_timeout_seconds = 0.2
+total_timeout_seconds = 0.5
+failure_confirmation = 3
+recovery_confirmation = 2

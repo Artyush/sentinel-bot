@@ -1,0 +1,15 @@
+[runtime]
+mode = "monitor"
+state_dir = "data"
+max_concurrency = 5
+
+[[sites]]
+alias = "example"
+url = "https://example.com/"
+poll_interval_seconds = 30
+connect_timeout_seconds = 5
+total_timeout_seconds = 10
+failure_confirmation = 3
+recovery_confirmation = 2
+reminder_interval_seconds = 1800
+max_body_bytes = 65536

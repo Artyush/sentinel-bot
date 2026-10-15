@@ -15,7 +15,7 @@ services:
     mem_limit: 128m
     cpus: 0.5
     environment:
-      SENTINEL_CONFIG: /app/config.toml
+      SENTINEL_CONFIG: ${SENTINEL_CONTAINER_CONFIG:-/app/config.toml}
       SENTINEL_STATE_DIR: /var/lib/sentinel
     volumes:
       - sentinel-state:/var/lib/sentinel

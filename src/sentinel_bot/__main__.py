@@ -1,9 +1,10 @@
-"""CLI for configuration, idle runtime, local health, and deliberate SMTP tests."""
+"""CLI for configuration, monitoring, cached status, health, and local SMTP tests."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ from pathlib import Path
 from sentinel_bot.config import ConfigError, load_settings
 from sentinel_bot.email import EmailError, send_test_email
 from sentinel_bot.runtime import InstanceError, healthcheck, run
+from sentinel_bot.status import status_snapshot
 from sentinel_bot.storage import StorageError
 
 
@@ -19,7 +21,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--config", type=Path, default=Path(os.environ.get("SENTINEL_CONFIG", "config/idle.toml"))
     )
-    parser.add_argument("command", choices=("check-config", "run", "healthcheck", "test-email"))
+    parser.add_argument(
+        "command", choices=("check-config", "run", "status", "healthcheck", "test-email")
+    )
     args = parser.parse_args(argv)
     try:
         settings = load_settings(args.config)
@@ -34,6 +38,16 @@ def main(argv: list[str] | None = None) -> int:
         healthy = healthcheck(settings)
         print("healthy" if healthy else "unhealthy")
         return 0 if healthy else 1
+    if args.command == "status":
+        try:
+            print(json.dumps(status_snapshot(settings), indent=2))
+        except (StorageError, OSError) as exc:
+            message = (
+                str(exc) if isinstance(exc, StorageError) else "Local state cannot be accessed."
+            )
+            print(f"Status error: {message}", file=sys.stderr)
+            return 1
+        return 0
     if args.command == "test-email":
         try:
             send_test_email()

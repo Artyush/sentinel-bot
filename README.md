@@ -21,4 +21,4 @@ Sources can use polling, event submission, or both. Attack detection belongs to 
 
 Monitoring is read-only and limited to explicitly configured sources. Server exporter endpoints are provisioned separately. The project is independent of business applications and their databases.
 
-[Docker setup and local email testing](docs/running.md)
+[Configuration, Docker setup and local testing](docs/running.md)
