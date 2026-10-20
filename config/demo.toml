@@ -1,3 +1,5 @@
+# Isolated website fixture for compose.monitoring.yaml; no external targets or Telegram.
+# Configuration reference: ../docs/configuration.md
 [runtime]
 mode = "demo"
 state_dir = "data"
@@ -9,6 +11,7 @@ max_concurrency = 2
 [[sites]]
 alias = "primary"
 url = "http://site-fixture:8080/primary"
+# The fixture includes READY when healthy and omits it during a simulated outage.
 marker = "READY"
 poll_interval_seconds = 0.2
 connect_timeout_seconds = 0.2
