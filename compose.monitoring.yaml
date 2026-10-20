@@ -30,11 +30,12 @@ services:
     cpus: 0.25
     networks:
       - sentinel
+    # Keep probe startup small under the fixture CPU quota.
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=1).close()"]
+      test: ["CMD", "python", "-c", "import socket\nwith socket.create_connection((\"127.0.0.1\", 8080), timeout=1) as connection:\n    connection.sendall(b\"GET /health HTTP/1.0\\r\\n\\r\\n\")\n    with connection.makefile(\"rb\") as response:\n        status = response.readline(128)\n        assert status.startswith(b\"HTTP/1.\") and status.split()[1:2] == [b\"200\"]"]
       interval: 1s
       timeout: 3s
-      start_period: 1s
+      start_period: 15s
       retries: 3
     logging:
       driver: json-file

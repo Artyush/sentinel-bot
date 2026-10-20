@@ -81,6 +81,37 @@ class TelegramSettings:
 
 
 @dataclass(frozen=True)
+class EmailSettings:
+    """Fixed operator routing; persisted destination keys contain no address."""
+
+    provider: str
+    api_key: str = field(repr=False)
+    from_address: str = field(repr=False)
+    recipients: tuple[str, ...] = field(repr=False)
+    request_timeout: float = 10.0
+    local_host: str = "mailpit"
+    local_port: int = 1025
+
+    @property
+    def destinations(self) -> tuple[str, ...]:
+        boundary = (self.local_host, self.local_port) if self.provider == "local_smtp" else None
+        return tuple(
+            "email:"
+            + hashlib.sha256(
+                json.dumps((self.provider, self.from_address, recipient, boundary)).encode()
+            ).hexdigest()
+            for recipient in self.recipients
+        )
+
+    def recipient_for(self, destination: str) -> str:
+        """Resolve only a configured opaque route, never an event-selected address."""
+        for key, recipient in zip(self.destinations, self.recipients, strict=True):
+            if key == destination:
+                return recipient
+        raise ValueError("Email destination is not configured.")
+
+
+@dataclass(frozen=True)
 class PushSource:
     """A configured sender; its credential authorizes no outbound operation."""
 
@@ -127,6 +158,7 @@ class Settings:
     telegram: TelegramSettings | None = field(default=None, repr=False)
     ingress: IngressSettings | None = None
     sources: tuple[PushSource, ...] = ()
+    email: EmailSettings | None = field(default=None, repr=False)
 
 
 def _duration(value: object, field: str, lower: float, upper: float) -> float:
@@ -328,6 +360,73 @@ def _telegram(value: object, environ: Mapping[str, str], mode: str) -> TelegramS
         if topic_id > 2**31 - 1 or chat_id > 0:
             raise ConfigError("Telegram topics require a group chat and a bounded topic ID.")
     return TelegramSettings(token, chat_id, users, topic_id)
+
+
+def _email_address(value: str) -> str:
+    if (
+        len(value) > 254
+        or re.fullmatch(
+            r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*"
+            r"@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+            r"[A-Za-z]{2,63}",
+            value,
+        )
+        is None
+    ):
+        raise ConfigError("Email addresses must be bounded plain ASCII mailboxes.")
+    local, domain = value.rsplit("@", 1)
+    if len(local) > 64:
+        raise ConfigError("Email addresses must be bounded plain ASCII mailboxes.")
+    return local + "@" + domain.lower()
+
+
+def _email(value: object, environ: Mapping[str, str], mode: str) -> EmailSettings | None:
+    allowed = {"enabled", "provider", "request_timeout_seconds", "local_host", "local_port"}
+    if not isinstance(value, dict) or set(value) - allowed:
+        raise ConfigError("Unsupported fields in [email].")
+    enabled = value.get("enabled", False)
+    if type(enabled) is not bool:
+        raise ConfigError("email.enabled must be a boolean.")
+    if not enabled:
+        return None
+    provider = value.get("provider", "mailchimp")
+    if not isinstance(provider, str) or provider not in {"mailchimp", "local_smtp"}:
+        raise ConfigError("Email provider must be mailchimp or local_smtp.")
+    if mode == "demo" and provider != "local_smtp":
+        raise ConfigError("The isolated demo can enable only synthetic local email.")
+    timeout = _duration(
+        value.get("request_timeout_seconds", 10.0), "email.request_timeout_seconds", 0.1, 10.0
+    )
+    host = value.get("local_host", "mailpit")
+    port = _integer(value.get("local_port", 1025), "email.local_port", 1025, 1025)
+    if not isinstance(host, str) or host not in {"mailpit", "localhost", "127.0.0.1", "::1"}:
+        raise ConfigError("Local email host must be Mailpit or loopback.")
+    if provider == "mailchimp" and {"local_host", "local_port"} & set(value):
+        raise ConfigError("Local SMTP settings require the local_smtp email provider.")
+    api_key = ""
+    if provider == "mailchimp":
+        api_key = environ.get("SENTINEL_EMAIL_API_KEY", "")
+        if re.fullmatch(r"[A-Za-z0-9_-]{16,128}", api_key) is None:
+            raise ConfigError("Mailchimp email requires a valid API key environment value.")
+    sender = _email_address(environ.get("SENTINEL_EMAIL_FROM", ""))
+    raw_recipients = environ.get("SENTINEL_EMAIL_RECIPIENTS", "")
+    if (
+        not raw_recipients
+        or len(raw_recipients) > 1279
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw_recipients)
+    ):
+        raise ConfigError("Email requires between one and five configured recipients.")
+    parts = raw_recipients.split(",")
+    if not 1 <= len(parts) <= 5:
+        raise ConfigError("Email requires between one and five configured recipients.")
+    recipients = tuple(_email_address(part.strip()) for part in parts)
+    if len({recipient.lower() for recipient in recipients}) != len(recipients):
+        raise ConfigError("Email recipients must be unique.")
+    if provider == "local_smtp" and any(
+        address.rsplit("@", 1)[1] != "example.test" for address in (sender, *recipients)
+    ):
+        raise ConfigError("Local email requires synthetic example.test addresses.")
+    return EmailSettings(provider, api_key, sender, recipients, timeout, host, port)
 
 
 def _ingress(value: object) -> IngressSettings | None:
@@ -532,7 +631,7 @@ def load_settings(path: Path, environ: Mapping[str, str] | None = None) -> Setti
     document = _read_document(path)
     if (
         "runtime" not in document
-        or set(document) - {"runtime", "sites", "telegram", "ingress", "sources"}
+        or set(document) - {"runtime", "sites", "telegram", "ingress", "sources", "email"}
         or not isinstance(document["runtime"], dict)
     ):
         raise ConfigError("Unsupported configuration sections or missing [runtime].")
@@ -567,9 +666,10 @@ def load_settings(path: Path, environ: Mapping[str, str] | None = None) -> Setti
     if mode != "idle" and not sites and not sources:
         raise ConfigError("Monitoring mode requires at least one enabled source.")
     telegram = _telegram(document.get("telegram", {}), env, mode)
+    email = _email(document.get("email", {}), env, mode)
     if ingress is not None:
-        if mode == "demo" or not sources or telegram is None:
-            raise ConfigError("Ingress requires configured sources and an enabled Telegram route.")
+        if mode == "demo" or not sources or (telegram is None and email is None):
+            raise ConfigError("Ingress requires configured sources and an enabled delivery route.")
         if (
             ingress.max_pending < 2 * ingress.max_active_incidents
             or ingress.max_pending_per_source < 2 * ingress.max_active_incidents_per_source
@@ -622,4 +722,5 @@ def load_settings(path: Path, environ: Mapping[str, str] | None = None) -> Setti
         telegram,
         ingress,
         sources,
+        email,
     )

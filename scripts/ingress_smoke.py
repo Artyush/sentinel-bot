@@ -13,7 +13,6 @@ from docker_smoke import ROOT, Stack
 
 def main() -> None:
     stack = Stack("sentinel-ingress-smoke-" + uuid4().hex[:10], local=False)
-    stack.base[2:2] = ["--env-file", ".env.example"]
     fixture = ROOT / "scripts" / "fixtures" / "ingress_app_smoke.py"
     with TemporaryDirectory(prefix="sentinel-ingress-smoke-") as directory:
         override = Path(directory) / "isolated.yaml"
@@ -32,6 +31,9 @@ def main() -> None:
                 "SENTINEL_TELEGRAM_ALLOWED_USER_IDS": "",
                 "SENTINEL_TELEGRAM_TOPIC_ID": "",
                 "SENTINEL_SOURCE_APP_TOKEN": "",
+                "SENTINEL_EMAIL_API_KEY": "",
+                "SENTINEL_EMAIL_FROM": "",
+                "SENTINEL_EMAIL_RECIPIENTS": "",
             }
             result = subprocess.run(
                 [

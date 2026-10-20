@@ -1,6 +1,6 @@
 # Incoming events API
 
-Sentinel accepts technical events from configured servers and services, persists them and queues Telegram notifications. Detection belongs to the sender. A push-only source needs no outbound probe from Sentinel.
+Sentinel accepts technical events from configured servers and services, persists them and queues notifications for every enabled channel and configured destination. Detection belongs to the sender. A push-only source needs no outbound probe from Sentinel.
 
 **`POST /api/v1/events`** — submit one notification or incident lifecycle event.
 
@@ -30,7 +30,7 @@ Send one JSON object. Unknown fields, duplicate JSON keys and non-finite numbers
 | --- | --- |
 | `notification` | Queue one independent alert immediately. |
 | `firing` | Open an occurrence and queue its first alert; repeated firing reports do not send another opening. |
-| `resolved` | Resolve the matching occurrence using its opening destination. Resolution received first stores a terminal record without a fabricated recovery. |
+| `resolved` | Resolve the matching occurrence using its opening destinations. Resolution received first stores a terminal record without a fabricated recovery. |
 
 The first accepted lifecycle report fixes its `type`. A resolved occurrence cannot reopen while its terminal record is retained, including when a newer firing report arrives. A resolution of an active occurrence cannot predate its opening. Silence leaves source availability unknown and does not resolve an incident.
 
@@ -72,7 +72,7 @@ To resolve it, submit a new `event_id`, a later `occurred_at`, `kind: "resolved"
 }
 ```
 
-Outcomes are `notification`, `opened`, `resolved` or `noop`. Acceptance does not mean Telegram accepted the message or a person read it. A retry with the same authenticated source, ID and canonical content returns the original receipt; changed content returns `409`. Retained identical retries are checked before new-event age and durable admission-capacity limits; request rate and concurrency limits still apply. A `noop` can still be durably accepted, for example a resolution received before its firing.
+Outcomes are `notification`, `opened`, `resolved` or `noop`. Acceptance does not mean a notification provider accepted the message or a person received it. A retry with the same authenticated source, ID and canonical content returns the original receipt; changed content returns `409`. Retained identical retries are checked before new-event age and durable admission-capacity limits; request rate and concurrency limits still apply. A `noop` can still be durably accepted, for example a resolution received before its firing.
 
 Application errors have the form `{"error":{"code":"unauthorized"}}`; they contain no tokens, raw bodies or private transport errors. The HTTP parser or reverse proxy may reject malformed protocol framing before dispatch, with a response outside this JSON contract.
 
@@ -89,7 +89,7 @@ Application errors have the form `{"error":{"code":"unauthorized"}}`; they conta
 | `429` | Request rate exhausted | Honor `Retry-After`. |
 | `503` | Admission/storage temporarily unavailable | Honor `Retry-After` and retry later. |
 
-After connection loss, timeout, `408`, `429` or `5xx`, retain the event locally and retry with bounded backoff and the same ID/content. A response may be lost after commit, so never create a fresh ID merely because an acknowledgement was lost. Permanent rejection or expiry requires visible sender-side handling. External provider acceptance followed by a local crash can still duplicate a Telegram message.
+After connection loss, timeout, `408`, `429` or `5xx`, retain the event locally and retry with bounded backoff and the same ID/content. A response may be lost after commit, so never create a fresh ID merely because an acknowledgement was lost. Permanent rejection or expiry requires visible sender-side handling. External provider acceptance followed by a local crash can still duplicate a Telegram message or email; recipients already marked provider-accepted are not deliberately retried.
 
 ## Default limits
 

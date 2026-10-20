@@ -12,7 +12,7 @@ The project's functional scope includes:
 - Telegram status commands for websites and servers, available in a configured group or private chat.
 - Access restrictions through an allowed-user list and an optional group topic.
 - Persistent monitoring state and a notification queue with retries during delivery failures.
-- Independent Telegram and email delivery to operator-configured destinations.
+- Independent Telegram and email delivery to operator-configured destinations, with per-recipient retries through Mailchimp Transactional and a local Mailpit incident demo.
 - Docker Compose execution with a dedicated state volume.
 
 The command interface consists of `/help`, `/status`, `/sites`, `/servers`, and `/server <alias>`. Status reports distinguish confirmed incidents from current readings and identify unknown or stale data.

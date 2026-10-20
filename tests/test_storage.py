@@ -13,13 +13,13 @@ def test_metadata_survives_reopening_and_stores_utc(tmp_path: Path) -> None:
     first = initialize_state(tmp_path, started)
     second = initialize_state(tmp_path, started + timedelta(days=1))
 
-    assert first.schema_version == second.schema_version == 4
+    assert first.schema_version == second.schema_version == 5
     assert first.first_started_at == "2026-01-01T08:00:00+00:00"
     assert second.first_started_at == first.first_started_at
     assert second.last_started_at == "2026-01-02T08:00:00+00:00"
     assert second.startup_count == 2
     with closing(sqlite3.connect(tmp_path / DATABASE_NAME)) as connection, connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
         assert connection.execute("SELECT count(*) FROM runtime_metadata").fetchone() == (1,)
 
 
@@ -29,7 +29,7 @@ def test_naive_startup_time_does_not_create_database(tmp_path: Path) -> None:
     assert not (tmp_path / DATABASE_NAME).exists()
 
 
-@pytest.mark.parametrize("version", [5, 100])
+@pytest.mark.parametrize("version", [6, 100])
 def test_unsupported_schema_is_not_modified(tmp_path: Path, version: int) -> None:
     database = tmp_path / DATABASE_NAME
     with closing(sqlite3.connect(database)) as connection, connection:

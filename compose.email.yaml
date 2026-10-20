@@ -1,0 +1,11 @@
+services:
+  sentinel:
+    environment:
+      SENTINEL_CONFIG: /app/config/email.local.toml
+      SENTINEL_EMAIL_API_KEY: ""
+      SENTINEL_EMAIL_FROM: sentinel@example.test
+      SENTINEL_EMAIL_RECIPIENTS: operator@example.test,backup@example.test
+      SENTINEL_TELEGRAM_BOT_TOKEN: ""
+      SENTINEL_TELEGRAM_CHAT_ID: ""
+      SENTINEL_TELEGRAM_ALLOWED_USER_IDS: ""
+      SENTINEL_TELEGRAM_TOPIC_ID: ""

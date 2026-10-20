@@ -25,6 +25,10 @@ def command(*args: str, expected: int = 0, timeout: float = 120) -> str:
             "SENTINEL_TELEGRAM_CHAT_ID": "",
             "SENTINEL_TELEGRAM_ALLOWED_USER_IDS": "",
             "SENTINEL_TELEGRAM_TOPIC_ID": "",
+            "SENTINEL_EMAIL_API_KEY": "",
+            "SENTINEL_EMAIL_FROM": "",
+            "SENTINEL_EMAIL_RECIPIENTS": "",
+            "SENTINEL_SOURCE_APP_TOKEN": "",
         },
         capture_output=True,
         text=True,
@@ -40,7 +44,16 @@ def command(*args: str, expected: int = 0, timeout: float = 120) -> str:
 
 class Stack:
     def __init__(self, name: str, *, local: bool) -> None:
-        self.base = ["docker", "compose", "-p", name, "-f", "compose.yaml"]
+        self.base = [
+            "docker",
+            "compose",
+            "--env-file",
+            ".env.example",
+            "-p",
+            name,
+            "-f",
+            "compose.yaml",
+        ]
         if local:
             self.base.extend(["-f", "compose.override.yaml"])
 

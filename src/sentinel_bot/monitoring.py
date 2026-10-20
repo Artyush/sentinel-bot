@@ -22,6 +22,7 @@ class MonitoringProgress:
     observations: dict[str, float] = field(default_factory=dict)
     telegram: dict[str, float] = field(default_factory=dict)
     ingress: float | None = None
+    email: dict[str, float] = field(default_factory=dict)
 
 
 async def _site_loop(
@@ -99,7 +100,7 @@ async def monitor_sites(
                         state_lock,
                         stopped,
                         progress,
-                        schedule_reminders=settings.telegram is None,
+                        schedule_reminders=settings.telegram is None and settings.email is None,
                     )
                 )
                 for site in settings.sites

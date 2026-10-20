@@ -401,11 +401,21 @@ def test_migration_from_schema_three_preserves_metadata_websites_and_delivery(
     store.apply_observation(site, Observation(NOW, CheckResult(False, ErrorKind.CONNECTION)))
     record = store.pending_notifications()[0]
     with closing(sqlite3.connect(store.database)) as connection, connection:
-        for table in ("event_receipts", "pushed_incidents", "push_sources"):
+        for table in (
+            "event_receipts",
+            "pushed_incidents",
+            "push_sources",
+            "email_routes",
+            "email_channel",
+            "email_outbox",
+            "email_site_routes",
+            "email_push_routes",
+            "email_progress",
+        ):
             connection.execute(f"DROP TABLE {table}")
         connection.execute("PRAGMA user_version = 3")
     metadata = initialize_state(store.database.parent, NOW + timedelta(seconds=1))
-    assert metadata.schema_version == 4
+    assert metadata.schema_version == 5
     assert metadata.startup_count == 2
     reopened = SQLiteStore(store.database.parent)
     assert reopened.pending_notifications() == (record,)
@@ -470,7 +480,17 @@ def test_failed_schema_three_ddl_upgrade_rolls_back_all_new_state(
     store: SQLiteStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     with closing(sqlite3.connect(store.database)) as connection, connection:
-        for table in ("event_receipts", "pushed_incidents", "push_sources"):
+        for table in (
+            "event_receipts",
+            "pushed_incidents",
+            "push_sources",
+            "email_routes",
+            "email_channel",
+            "email_outbox",
+            "email_site_routes",
+            "email_push_routes",
+            "email_progress",
+        ):
             connection.execute(f"DROP TABLE {table}")
         connection.execute("PRAGMA user_version = 3")
         original_metadata = connection.execute("SELECT * FROM runtime_metadata").fetchall()

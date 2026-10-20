@@ -77,6 +77,8 @@ def _write_heartbeat(
             heartbeat["telegram"] = progress.telegram.copy()
         if progress.ingress is not None:
             heartbeat["ingress"] = progress.ingress
+        if progress.email:
+            heartbeat["email"] = progress.email.copy()
     encoded = json.dumps(heartbeat).encode()
     if len(encoded) > MAX_HEALTH_BYTES:
         raise RuntimeError("Local health record exceeds its size bound")
@@ -141,6 +143,12 @@ async def run(settings: Settings) -> None:
                     datetime.now(UTC),
                 )
             )
+            await _blocking(
+                lambda: store.configure_email(
+                    () if settings.email is None else settings.email.destinations,
+                    datetime.now(UTC),
+                )
+            )
             await _blocking(lambda: store.reconcile(settings.sites))
             await _blocking(lambda: store.reconcile_push_sources(settings.sources))
             state_lock = asyncio.Lock()
@@ -149,6 +157,7 @@ async def run(settings: Settings) -> None:
                 settings.mode != "idle"
                 or settings.telegram is not None
                 or settings.ingress is not None
+                or settings.email is not None
             ):
                 progress = MonitoringProgress(
                     workers={
@@ -159,6 +168,10 @@ async def run(settings: Settings) -> None:
                     from sentinel_bot.telegram_runtime import WORKER_NAMES
 
                     progress.telegram = {name: time.monotonic() for name in WORKER_NAMES}
+                if settings.email is not None:
+                    from sentinel_bot.email_runtime import WORKER_NAMES as EMAIL_WORKER_NAMES
+
+                    progress.email = {name: time.monotonic() for name in EMAIL_WORKER_NAMES}
             workers = [asyncio.create_task(_heartbeat(settings, guard.run_id, stopped, progress))]
             if progress is not None and settings.sites:
                 workers.append(
@@ -177,6 +190,12 @@ async def run(settings: Settings) -> None:
 
                 workers.append(
                     asyncio.create_task(run_ingress(settings, stopped, progress, state_lock))
+                )
+            if progress is not None and settings.email is not None:
+                from sentinel_bot.email_runtime import run_email
+
+                workers.append(
+                    asyncio.create_task(run_email(settings, stopped, progress, state_lock))
                 )
             stop_waiter = asyncio.create_task(stopped.wait())
             try:
@@ -300,6 +319,19 @@ def _current_heartbeat(
                 return None
             if check_workers and not is_fresh(value, time.monotonic(), settings.health_timeout):
                 return None
+        if settings.email is not None:
+            from sentinel_bot.email_runtime import WORKER_NAMES as EMAIL_WORKER_NAMES
+            from sentinel_bot.email_runtime import WORKER_TIMEOUT as EMAIL_WORKER_TIMEOUT
+
+            channel = heartbeat.get("email")
+            if not isinstance(channel, dict) or set(channel) != EMAIL_WORKER_NAMES:
+                return None
+            for name in EMAIL_WORKER_NAMES:
+                value = channel[name]
+                if type(value) not in (float, int) or not isinstance(value, (float, int)):
+                    return None
+                if check_workers and not is_fresh(value, time.monotonic(), EMAIL_WORKER_TIMEOUT):
+                    return None
         if not _lock_is_held(fd) or _read_record(settings.state_dir / LOCK_NAME) != owner:
             return None
         return heartbeat
