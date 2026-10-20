@@ -50,7 +50,7 @@ Run commands from the cloned repository root. Docker requires a running engine a
 | [`config/ingress.example.toml`](../config/ingress.example.toml) | Push-only source and configured delivery | Optional private listener; HTTPS proxy provisioned separately |
 | [`config/email.example.toml`](../config/email.example.toml) | Website monitoring and production email | Mailchimp Transactional account and authenticated sender required |
 | [`config/email.local.toml`](../config/email.local.toml) | Offline website incidents delivered to Mailpit | Synthetic fixture, synthetic addresses, no provider account |
-| [`config/checks.example.toml`](../config/checks.example.toml) | Shared endpoint inventory for website/Telegram configurations | Endpoint tables only; do not select it as the main configuration |
+| [`config/checks.example.toml`](../config/checks.example.toml) | Shared endpoint inventory for website, Telegram and production email configurations | Endpoint tables only; do not select it as the main configuration |
 
 The seven main configurations and shared endpoint inventory are baked into the image. Edit a supported file and rebuild; creating another host TOML file does not automatically put it in the image. Native execution can select another main file with `--config`. Main files support `[runtime]`, `[telegram]`, optional `[email]`/`[ingress]`/`[[sources]]` and inline `[[sites]]`, or `runtime.sites_file` instead of inline sites. The separate endpoint file supports only `[[sites]]`; unknown keys and unsupported `[[servers]]` tables fail validation.
 
