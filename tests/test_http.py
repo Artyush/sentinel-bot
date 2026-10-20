@@ -1,5 +1,6 @@
 import asyncio
 import gzip
+import json
 import socket
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -20,7 +21,7 @@ async def http_fixture(
     handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
 ) -> AsyncIterator[str]:
     app = web.Application()
-    app.router.add_route("GET", "/{path:.*}", handler)
+    app.router.add_route("*", "/{path:.*}", handler)
     runner = web.AppRunner(app, shutdown_timeout=0.1)
     await runner.setup()
     server = web.TCPSite(runner, "127.0.0.1", 0)
@@ -668,5 +669,262 @@ def test_cancelled_checks_restore_capacity_for_the_next_request() -> None:
                     with pytest.raises(asyncio.CancelledError):
                         await checking
                 assert (await checker.check(site(url, total_timeout=0.1))).success
+
+    asyncio.run(scenario())
+
+
+def test_post_sends_configured_json_bytes_and_unicode_without_extra_fields() -> None:
+    async def scenario() -> None:
+        payload = {
+            "probe": "availability",
+            "message": "Привет 🌍",
+            "nested": {"enabled": True, "threshold": 2},
+            "values": [None, 1.5],
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+        received: list[bytes] = []
+
+        async def respond(request: web.Request) -> web.Response:
+            assert request.method == "POST"
+            assert request.path == "/health/probe"
+            assert request.headers["Content-Type"] == "application/json"
+            assert request.content_length == len(encoded)
+            assert "Authorization" not in request.headers
+            assert "Cookie" not in request.headers
+            received.append(await request.read())
+            assert json.loads(received[-1]) == payload
+            return web.Response(status=201, text="READY")
+
+        async with http_fixture(respond) as url:
+            async with HttpChecker(fixture_hosts=frozenset({"127.0.0.1"})) as checker:
+                result = await checker.check(
+                    site(
+                        url + "/health/probe",
+                        method="POST",
+                        request_body=encoded,
+                        marker="READY",
+                        status_min=201,
+                        status_max=201,
+                    )
+                )
+        assert result.success
+        assert result.http_status == 201
+        assert received == [encoded]
+        assert payload["message"] not in repr(result)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_bodyless_checks_send_no_json_payload(method: str) -> None:
+    async def scenario() -> None:
+        received: list[bytes] = []
+
+        async def respond(request: web.Request) -> web.Response:
+            assert request.method == method
+            assert request.headers.get("Content-Type") != "application/json"
+            received.append(await request.read())
+            return web.Response(status=204)
+
+        async with http_fixture(respond) as url:
+            async with HttpChecker(fixture_hosts=frozenset({"127.0.0.1"})) as checker:
+                result = await checker.check(site(url, method=method))
+        assert result.success
+        assert received == [b""]
+
+    asyncio.run(scenario())
+
+
+def test_post_empty_json_object_remains_an_explicit_json_body() -> None:
+    async def scenario() -> None:
+        async def respond(request: web.Request) -> web.Response:
+            assert request.method == "POST"
+            assert request.headers["Content-Type"] == "application/json"
+            assert await request.read() == b"{}"
+            return web.Response(text="READY")
+
+        async with http_fixture(respond) as url:
+            async with HttpChecker(fixture_hosts=frozenset({"127.0.0.1"})) as checker:
+                result = await checker.check(site(url, method="POST", request_body=b"{}"))
+        assert result.success
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("status", "response_body", "limit", "expected"),
+    [
+        (200, b"READY", 32, None),
+        (503, b"READY", 32, ErrorKind.HTTP_STATUS),
+        (200, b"missing", 32, ErrorKind.MARKER),
+        (200, b"READY\xff", 32, ErrorKind.MARKER),
+        (200, b"READY" + b"a" * 32, 32, ErrorKind.BODY_LIMIT),
+    ],
+)
+def test_post_uses_existing_status_marker_and_response_limits(
+    status: int, response_body: bytes, limit: int, expected: ErrorKind | None
+) -> None:
+    async def scenario() -> None:
+        calls = 0
+        payload = b'{"probe":"synthetic-private-value"}'
+
+        async def respond(request: web.Request) -> web.Response:
+            nonlocal calls
+            calls += 1
+            assert request.method == "POST"
+            assert await request.read() == payload
+            return web.Response(status=status, body=response_body)
+
+        async with http_fixture(respond) as url:
+            async with HttpChecker(fixture_hosts=frozenset({"127.0.0.1"})) as checker:
+                result = await checker.check(
+                    site(
+                        url,
+                        method="POST",
+                        request_body=payload,
+                        marker="READY",
+                        max_body_bytes=limit,
+                    )
+                )
+        assert result.error is expected
+        assert result.http_status == status
+        assert calls == 1
+        assert "synthetic-private-value" not in repr(result)
+        assert "READY" not in repr(result)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+@pytest.mark.parametrize("body", [None, b'{"probe":"availability"}'])
+def test_post_redirect_is_never_followed_or_changed_to_get(status: int, body: bytes | None) -> None:
+    async def scenario() -> None:
+        requests: list[tuple[str, str, bytes]] = []
+
+        async def respond(request: web.Request) -> web.Response:
+            requests.append((request.method, request.path, await request.read()))
+            return web.Response(status=status, headers={"Location": "/redirected"})
+
+        async with http_fixture(respond) as url:
+            async with HttpChecker(fixture_hosts=frozenset({"127.0.0.1"})) as checker:
+                result = await checker.check(site(url + "/probe", method="POST", request_body=body))
+        assert result.error is ErrorKind.REDIRECT
+        assert result.http_status == status
+        assert requests == [("POST", "/probe", body or b"")]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("body", [None, b'{"probe":"availability"}'])
+def test_post_disconnect_after_receiving_request_does_not_resend(body: bytes | None) -> None:
+    async def scenario() -> None:
+        requests: list[tuple[str, bytes]] = []
+
+        async def drop(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            try:
+                async with asyncio.timeout(1):
+                    headers = await reader.readuntil(b"\r\n\r\n")
+                    lines = headers.split(b"\r\n")
+                    length = next(
+                        (
+                            int(line.split(b":", 1)[1])
+                            for line in lines
+                            if line.lower().startswith(b"content-length:")
+                        ),
+                        0,
+                    )
+                    requests.append(
+                        (lines[0].split(b" ", 1)[0].decode(), await reader.readexactly(length))
+                    )
+            finally:
+                writer.transport.abort()
+
+        server = await asyncio.start_server(drop, "127.0.0.1", 0)
+        async with server:
+            port = server.sockets[0].getsockname()[1]
+            async with HttpChecker(fixture_hosts=frozenset({"127.0.0.1"})) as checker:
+                result = await checker.check(
+                    site(f"http://127.0.0.1:{port}/", method="POST", request_body=body)
+                )
+        assert result.error is ErrorKind.CONNECTION
+        assert requests == [("POST", body or b"")]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("phase", ["headers", "body"])
+def test_post_deadline_does_not_resend_a_received_request(phase: str) -> None:
+    async def scenario() -> None:
+        calls = 0
+
+        async def respond(request: web.Request) -> web.StreamResponse:
+            nonlocal calls
+            calls += 1
+            assert request.method == "POST"
+            assert await request.read() == b"{}"
+            response = web.StreamResponse()
+            if phase == "body":
+                await response.prepare(request)
+            await asyncio.Event().wait()
+            return response
+
+        async with http_fixture(respond) as url:
+            async with HttpChecker(fixture_hosts=frozenset({"127.0.0.1"})) as checker:
+                result = await checker.check(
+                    site(url, method="POST", request_body=b"{}", marker="READY", total_timeout=0.03)
+                )
+        assert result.error is ErrorKind.TIMEOUT
+        assert calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_post_cancellation_does_not_resend_and_releases_request_capacity() -> None:
+    async def scenario() -> None:
+        entered = asyncio.Event()
+        methods: list[str] = []
+
+        async def respond(request: web.Request) -> web.Response:
+            methods.append(request.method)
+            if request.method == "POST":
+                assert await request.read() == b"{}"
+                entered.set()
+                await asyncio.Event().wait()
+            return web.Response(text="READY")
+
+        async with http_fixture(respond) as url:
+            async with HttpChecker(
+                max_concurrency=1, fixture_hosts=frozenset({"127.0.0.1"})
+            ) as checker:
+                checking = asyncio.create_task(
+                    checker.check(site(url, method="POST", request_body=b"{}"))
+                )
+                await entered.wait()
+                checking.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await checking
+                assert (await checker.check(site(url, total_timeout=0.1))).success
+        assert methods == ["POST", "GET"]
+
+    asyncio.run(scenario())
+
+
+def test_post_is_sent_again_only_when_a_new_check_is_requested() -> None:
+    async def scenario() -> None:
+        requests: list[bytes] = []
+
+        async def respond(request: web.Request) -> web.Response:
+            assert request.method == "POST"
+            requests.append(await request.read())
+            return web.Response(status=503 if len(requests) == 1 else 200, text="READY")
+
+        async with http_fixture(respond) as url:
+            async with HttpChecker(fixture_hosts=frozenset({"127.0.0.1"})) as checker:
+                configured = site(url, method="POST", request_body=b"{}", marker="READY")
+                first = await checker.check(configured)
+                assert first.error is ErrorKind.HTTP_STATUS
+                assert requests == [b"{}"]
+                assert (await checker.check(configured)).success
+        assert requests == [b"{}", b"{}"]
 
     asyncio.run(scenario())

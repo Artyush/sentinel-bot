@@ -1,0 +1,46 @@
+# Shared endpoint inventory for sites.example.toml and telegram.example.toml.
+# Replace public placeholders with intended, repeatedly safe monitoring endpoints.
+# Configuration reference: ../docs/configuration.md
+[[sites]]
+alias = "example"
+url = "https://example.com/"
+method = "GET"
+# Optional exact, case-sensitive UTF-8 substring; omit to skip reading the body.
+# An empty marker is invalid. This text matches the public placeholder.
+# marker = "Example Domain"
+# Inclusive successful HTTP status range, after allowed GET redirects.
+status_min = 200
+status_max = 399
+# Each endpoint has its own interval; all durations use seconds.
+poll_interval_seconds = 30
+# Total timeout includes DNS, redirects and response body reads.
+connect_timeout_seconds = 5
+total_timeout_seconds = 10
+# Consecutive observations required to confirm DOWN or RECOVERY.
+failure_confirmation = 3
+recovery_confirmation = 2
+# Reminders need an accepted opening alert and a fresh, ongoing incident.
+reminder_interval_seconds = 1800
+# Body limit for marker validation, applied to encoded and decoded bytes.
+max_body_bytes = 65536
+enabled = true
+
+# An independent GET health endpoint; edit the URL before enabling it.
+[[sites]]
+alias = "api_health"
+url = "https://example.com/health"
+method = "GET"
+poll_interval_seconds = 15
+enabled = false
+
+# A POST health probe must be safe to repeat, including after an unknown outcome.
+# Edit the URL and explicitly enable it only for an endpoint you intend to probe.
+# No POST requests to this placeholder are sent while enabled = false.
+[[sites]]
+alias = "api_probe"
+url = "https://example.com/health/probe"
+method = "POST"
+# Optional POST-only JSON object; remove this field for a POST without a body.
+json_body = { probe = "availability" }
+poll_interval_seconds = 60
+enabled = false

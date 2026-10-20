@@ -4,7 +4,7 @@ Sentinel Bot is a self-hosted monitoring and notification project for websites, 
 
 The project's functional scope includes:
 
-- HTTP(S) availability checks with timeouts, TLS verification, response latency, and optional content validation.
+- Configured HTTP(S) GET and POST availability checks, with independent endpoint intervals, timeouts, TLS verification, response latency, optional JSON request bodies and content validation.
 - Linux CPU, memory, uptime, and configured filesystem metrics from Node Exporter endpoints.
 - Authenticated HTTP endpoints for events submitted by configured servers and services, including locally detected security incidents.
 - Push-only sources that send events without allowing Sentinel to connect to their systems.

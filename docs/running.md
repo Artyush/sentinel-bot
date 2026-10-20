@@ -1,6 +1,6 @@
 # Running Sentinel Bot
 
-This guide covers the implemented application. For every supported TOML key, environment variable, default and validation limit, see the [configuration reference](configuration.md). The checked-in [website example](../config/sites.example.toml) and [Telegram example](../config/telegram.example.toml) contain optional settings as comments.
+This guide covers the implemented application. For every supported TOML key, environment variable, default and validation limit, see the [configuration reference](configuration.md). The [website configuration](../config/sites.example.toml) and [Telegram configuration](../config/telegram.example.toml) share a separate [endpoint inventory](../config/checks.example.toml), with commented optional settings and disabled additional probes.
 
 ## Contents
 
@@ -9,6 +9,7 @@ This guide covers the implemented application. For every supported TOML key, env
 - [Local Docker and Mailpit](#local-docker-and-mailpit)
 - [Offline website demo](#offline-website-demo)
 - [Monitor public websites](#monitor-public-websites)
+- [Configure endpoint inventory](#configure-endpoint-inventory)
 - [Configure Telegram](#configure-telegram)
 - [Check content with marker](#check-content-with-marker)
 - [Verify a notification](#verify-a-notification)
@@ -21,7 +22,7 @@ This guide covers the implemented application. For every supported TOML key, env
 
 | Capability | Current behavior |
 | --- | --- |
-| Website monitoring | Configured HTTP(S) GET requests, accepted status range, optional content marker, latency and normalized failure reasons |
+| Website monitoring | Configured HTTP(S) GET/POST requests, independent endpoint intervals, optional JSON request bodies, accepted status range, content markers, latency and normalized failure reasons |
 | Incident policy | UNKNOWN/UP/DOWN, consecutive failure/recovery confirmation, stable incident IDs and fresh-only reminders after accepted delivery |
 | Telegram | One fixed private chat, group/topic, or channel for alerts; cached authorized commands in private chats/groups |
 | Persistent delivery | SQLite outbox, bounded retries, shared send limits, provider rate pauses and restart continuity |
@@ -41,8 +42,9 @@ Run commands from the cloned repository root. Docker requires a running engine a
 | [`config/sites.example.toml`](../config/sites.example.toml) | Monitor operator-selected public websites | Outbound HTTP(S); Telegram disabled |
 | [`config/telegram.example.toml`](../config/telegram.example.toml) | Website monitoring and Telegram | Outbound HTTP(S), Telegram credentials required |
 | [`config/demo.toml`](../config/demo.toml) | Fast synthetic website checks | Named local fixture only; live Telegram prohibited |
+| [`config/checks.example.toml`](../config/checks.example.toml) | Shared endpoint inventory for website/Telegram configurations | Endpoint tables only; do not select it as the main configuration |
 
-These four files are baked into the image. Edit a supported example and rebuild; creating another host TOML file does not automatically put it in the image. Native execution can select another file with `--config`. Only `[runtime]`, `[telegram]` and `[[sites]]` are supported; adding guessed `[email]` or `[[servers]]` tables fails validation.
+The four main configurations and shared endpoint inventory are baked into the image. Edit a supported file and rebuild; creating another host TOML file does not automatically put it in the image. Native execution can select another main file with `--config`. Main files support `[runtime]`, `[telegram]` and inline `[[sites]]`, or `runtime.sites_file` instead of inline sites. The separate endpoint file supports only `[[sites]]`; adding guessed `[email]` or `[[servers]]` tables fails validation.
 
 If `.env` does not exist, copy the template once:
 
@@ -103,7 +105,7 @@ docker compose -p sentinel-demo -f compose.yaml -f compose.monitoring.yaml down
 
 ## Monitor public websites
 
-Edit `config/sites.example.toml`: replace the public placeholder with a read-only page you intend to monitor. Add another `[[sites]]` table for each website, using a unique alias; at most 20 entries are supported. Full settings and ranges are in [website configuration](configuration.md#website-checks-sites).
+Edit `config/checks.example.toml`: replace the enabled public placeholder with a repeatedly safe endpoint you intend to monitor. It is loaded by `config/sites.example.toml` through `runtime.sites_file`. Add a separate `[[sites]]` table for each endpoint, using a unique alias; at most 20 entries are supported, including disabled examples. Full settings and ranges are in [website configuration](configuration.md#website-checks-sites).
 
 Set this line in `.env`:
 
@@ -122,9 +124,46 @@ docker compose -p sentinel-live -f compose.yaml exec sentinel python -m sentinel
 
 Use `-f compose.yaml` explicitly. It excludes the automatic local override and permits outbound requests. Keep a different project name from an existing internal-network local stack; changing file selection does not safely migrate an already-created network.
 
-Live targets must use HTTP(S), ports 80 or 443 and public addresses. URLs cannot include credentials, query strings or fragments. TLS and every DNS answer are checked. At most three same-origin redirects are followed; ambient proxies/cookies are disabled. `localhost`, private IPs and local Docker service names are rejected outside the restricted demo. There is no browser/JavaScript execution, SSH, service restart or arbitrary target discovery.
+Live targets must use HTTP(S), ports 80 or 443 and public addresses. URLs cannot include credentials, query strings or fragments. TLS and every DNS answer are checked. GET follows at most three same-origin redirects; POST rejects redirects and never replays the body to a redirect target. Ambient proxies/cookies are disabled. `localhost`, private IPs and local Docker service names are rejected outside the restricted demo. There is no browser/JavaScript execution, authentication-header setting, SSH, service restart or arbitrary target discovery.
 
 A source never overlaps its own checks. Slow sources are independent; missed polling slots are skipped. Waiting for shared capacity is bounded and can defer a check without counting as website failure. Freshness and worker progress are separate from the confirmed incident state.
+
+## Configure endpoint inventory
+
+Keep process/Telegram settings in `config/sites.example.toml` or `config/telegram.example.toml`. Both select the same file through:
+
+```toml
+[runtime]
+mode = "monitor"
+sites_file = "checks.example.toml"
+```
+
+`sites_file` is resolved relative to the main TOML file, so the supplied Docker image loads `/app/config/checks.example.toml`. It must stay within that directory; absolute paths, parent traversal and escaping symlinks are rejected. Do not also add inline `[[sites]]` to a main file using this setting. Older main files with inline sites remain supported when `sites_file` is absent.
+
+In `config/checks.example.toml`, repeat `[[sites]]` for independent endpoints on the same or different services:
+
+```toml
+[[sites]]
+alias = "api_health"
+url = "https://example.com/health"
+method = "GET"
+poll_interval_seconds = 15
+enabled = false
+
+[[sites]]
+alias = "api_probe"
+url = "https://example.com/health/probe"
+method = "POST"
+json_body = { probe = "availability" }
+poll_interval_seconds = 60
+enabled = false
+```
+
+These rows already exist as disabled examples. Replace their URLs and explicitly enable intended checks; do not append duplicate aliases. Each endpoint has its own observation, confirmation counters, incident and polling interval. The default method is GET. POST accepts an optional JSON object up to 4096 encoded UTF-8 bytes; omit `json_body` for a bodyless POST. A GET cannot contain `json_body`.
+
+Choose a POST endpoint designed for repeated health probes, including repeated requests after a timeout with an unknown outcome. Do not use business actions such as creating payments or users. Sentinel does no login, multi-step workflow or immediate transport retry; each attempt belongs to the endpoint's polling schedule. POST 301/302/303/307/308 responses fail as `redirect` without following them. See [POST body encoding and limits](configuration.md#post-health-probes).
+
+Only the original GET `example` endpoint is enabled in the shared sample. Its marker is commented out; disabled example rows are still validated. Editing the shared inventory affects both main configurations when rebuilt/restarted. The demo continues using its own inline synthetic fixture inventory.
 
 ## Configure Telegram
 
@@ -148,7 +187,7 @@ To obtain your own human user ID, do this **before starting Sentinel's poller**,
 
 ### Enable Telegram and start
 
-Edit `config/telegram.example.toml` with your monitored websites. In `.env`, select that config and fill the four channel variables:
+Edit `config/checks.example.toml` with your intended endpoints; `config/telegram.example.toml` loads that inventory and enables Telegram. In `.env`, select the main Telegram config and fill the four channel variables:
 
 ```dotenv
 SENTINEL_CONTAINER_CONFIG=/app/config/telegram.example.toml
@@ -180,7 +219,7 @@ Replies are plain text with UTC snapshot time, bounded to 3500 UTF-16 units. Lim
 
 ## Check content with marker
 
-Without `marker`, a website check inspects the HTTP status and closes the response without reading its body. To require content as well, uncomment the example inside that site's `[[sites]]` table:
+Without `marker`, a website check inspects the HTTP status and closes the response without reading its body. To require content as well, uncomment the example inside that endpoint's `[[sites]]` table in `config/checks.example.toml`:
 
 ```toml
 marker = "Example Domain"
@@ -190,13 +229,13 @@ The configured status range must match and the response must contain this exact,
 
 Disable the content check by removing/commenting the field. **`marker = ""` is invalid.** A marker is at most 4096 UTF-8 bytes and cannot exceed `max_body_bytes`; encoded and decoded response bodies are each bounded to that body's configured limit, at most 65536 bytes. A missing marker or body-limit violation is a failed observation.
 
-Changing marker, URL, accepted statuses, confirmation counts, body limit or request timeouts resets that source's confirmed state without inventing RECOVERY. Poll/reminder interval changes retain the incident. Configuration changes require a rebuild in Docker; they are not a way to simulate recovery of an existing incident.
+Changing marker, URL, method, JSON body, accepted statuses, confirmation counts, body limit or request timeouts resets that source's confirmed state without inventing RECOVERY. Poll/reminder interval changes retain the incident. Configuration changes require a rebuild in Docker; they are not a way to simulate recovery of an existing incident.
 
 ## Verify a notification
 
 For a private/group destination, send `/status` from an allowed user in the configured chat/topic after startup. For a broadcast channel, test an outgoing incident instead of a command.
 
-For a deliberate DOWN test, temporarily replace the existing site's marker with an absent string in `config/telegram.example.toml`, or add the field if it is absent. Keep only one active `marker` key inside that site's `[[sites]]` table:
+For a deliberate DOWN test, temporarily replace the enabled `example` endpoint's marker with an absent string in `config/checks.example.toml`, or add the field if it is absent. Keep only one active `marker` key inside that endpoint's `[[sites]]` table:
 
 ```toml
 marker = "SENTINEL_MANUAL_TEST_MISSING_MARKER"
@@ -239,7 +278,7 @@ Provider acceptance is not proof a human read the message. A crash between exter
 
 | Change | Apply it |
 | --- | --- |
-| A baked TOML example or application code | `build sentinel`, then `up -d --wait --force-recreate sentinel` using the same project/files |
+| A baked main configuration, shared endpoint inventory or application code | `build sentinel`, then `up -d --wait --force-recreate sentinel` using the same project/files |
 | `.env` credentials, destination, topic or selected config | `up -d --wait --force-recreate sentinel`; rebuild too if the TOML changed |
 | Native TOML or exported environment | Stop the process and start it again with the same state path |
 

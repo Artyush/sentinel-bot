@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 MAX_CONFIG_BYTES = 16 * 1024
+MAX_REQUEST_BODY_BYTES = 4096
 
 
 class ConfigError(ValueError):
@@ -36,11 +37,13 @@ class SiteConfig:
     reminder_interval: float = 1800.0
     max_body_bytes: int = 65536
     enabled: bool = True
+    method: str = "GET"
+    request_body: bytes | None = field(default=None, repr=False)
 
     @property
     def fingerprint(self) -> str:
         """Identify check and transition semantics, excluding scheduling changes."""
-        value = (
+        value: tuple[object, ...] = (
             self.url,
             self.marker,
             self.status_min,
@@ -51,6 +54,11 @@ class SiteConfig:
             self.connect_timeout,
             self.total_timeout,
         )
+        if self.method != "GET" or self.request_body is not None:
+            value += (
+                self.method,
+                None if self.request_body is None else self.request_body.hex(),
+            )
         return hashlib.sha256(json.dumps(value, ensure_ascii=True).encode()).hexdigest()
 
     @property
@@ -169,6 +177,8 @@ def _site(value: object, mode: str) -> SiteConfig:
         "reminder_interval_seconds",
         "max_body_bytes",
         "enabled",
+        "method",
+        "json_body",
     }
     if set(row) - allowed:
         raise ConfigError("Unsupported site configuration fields.")
@@ -176,6 +186,25 @@ def _site(value: object, mode: str) -> SiteConfig:
     if not isinstance(alias, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", alias):
         raise ConfigError("Site alias must be a unique bounded identifier.")
     url = _url(row.get("url"), mode)
+    method = row.get("method", "GET")
+    if not isinstance(method, str) or method not in {"GET", "POST"}:
+        raise ConfigError("Site method must be GET or POST.")
+    request_body = None
+    if "json_body" in row:
+        if method != "POST" or not isinstance(row["json_body"], dict):
+            raise ConfigError("Site json_body requires POST and a TOML table.")
+        try:
+            request_body = json.dumps(
+                row["json_body"],
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ConfigError("Site json_body must contain only supported JSON values.") from exc
+        if len(request_body) > MAX_REQUEST_BODY_BYTES:
+            raise ConfigError("Site json_body cannot exceed 4096 UTF-8 bytes.")
     maximum = _integer(row.get("max_body_bytes", 65536), "max_body_bytes", 1, 65536)
     marker = row.get("marker")
     if marker is not None and (
@@ -213,6 +242,8 @@ def _site(value: object, mode: str) -> SiteConfig:
         ),
         max_body_bytes=maximum,
         enabled=enabled,
+        method=method,
+        request_body=request_body,
     )
 
 
@@ -262,8 +293,7 @@ def _telegram(value: object, environ: Mapping[str, str], mode: str) -> TelegramS
     return TelegramSettings(token, chat_id, users, topic_id)
 
 
-def load_settings(path: Path, environ: Mapping[str, str] | None = None) -> Settings:
-    """Read a bounded TOML file without probing sources or creating state."""
+def _read_document(path: Path) -> dict[str, object]:
     try:
         with path.open("rb") as source:
             raw = source.read(MAX_CONFIG_BYTES + 1)
@@ -272,10 +302,46 @@ def load_settings(path: Path, environ: Mapping[str, str] | None = None) -> Setti
     if len(raw) > MAX_CONFIG_BYTES:
         raise ConfigError("Configuration exceeds 16 KiB.")
     try:
-        document = tomllib.loads(raw.decode("utf-8"))
+        return tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError, RecursionError) as exc:
         raise ConfigError("Configuration must be valid UTF-8 TOML.") from exc
 
+
+def _site_rows(
+    document: dict[str, object], runtime: dict[str, object], config_path: Path
+) -> object:
+    if "sites_file" not in runtime:
+        return document.get("sites", [])
+    if "sites" in document:
+        raise ConfigError("Inline sites cannot be combined with runtime.sites_file.")
+    value = runtime["sites_file"]
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > 2048
+        or "\\" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ConfigError("runtime.sites_file must be a bounded relative path.")
+    relative = Path(value)
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise ConfigError("runtime.sites_file must stay within its configuration directory.")
+    try:
+        directory = config_path.parent.resolve()
+        inventory = (directory / relative).resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigError("Site inventory path cannot be resolved.") from exc
+    if not inventory.is_relative_to(directory):
+        raise ConfigError("runtime.sites_file must stay within its configuration directory.")
+    external = _read_document(inventory)
+    if set(external) != {"sites"}:
+        raise ConfigError("Site inventory must contain only [[sites]] tables.")
+    return external["sites"]
+
+
+def load_settings(path: Path, environ: Mapping[str, str] | None = None) -> Settings:
+    """Read bounded TOML files without probing sources or creating state."""
+    document = _read_document(path)
     if (
         "runtime" not in document
         or set(document) - {"runtime", "sites", "telegram"}
@@ -290,13 +356,14 @@ def load_settings(path: Path, environ: Mapping[str, str] | None = None) -> Setti
         "health_timeout_seconds",
         "shutdown_timeout_seconds",
         "max_concurrency",
+        "sites_file",
     }
     if set(runtime) - allowed:
         raise ConfigError("Unsupported fields in [runtime].")
     mode = runtime.get("mode")
     if not isinstance(mode, str) or mode not in {"idle", "monitor", "demo"}:
         raise ConfigError("runtime.mode must explicitly be idle, monitor, or demo.")
-    site_rows = document.get("sites", [])
+    site_rows = _site_rows(document, runtime, path)
     if not isinstance(site_rows, list) or len(site_rows) > 20:
         raise ConfigError("Inventory must contain at most 20 site tables.")
     sites = tuple(_site(row, mode) for row in site_rows)

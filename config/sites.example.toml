@@ -1,4 +1,4 @@
-# Public placeholder: replace it with your intended monitoring target before running.
+# Website monitoring settings; endpoint inventory is in checks.example.toml.
 # Configuration reference: ../docs/configuration.md
 [runtime]
 mode = "monitor"
@@ -9,26 +9,5 @@ health_timeout_seconds = 5.0
 shutdown_timeout_seconds = 5.0
 # Shared maximum for concurrent website requests; supported range: 1 to 5.
 max_concurrency = 5
-
-[[sites]]
-alias = "example"
-url = "https://example.com/"
-# Optional exact, case-sensitive UTF-8 substring; omit to skip reading the body.
-# An empty marker is invalid. This example text matches the public placeholder.
-# marker = "Example Domain"
-# Inclusive successful HTTP status range, after allowed redirects.
-status_min = 200
-status_max = 399
-# All durations use seconds; total timeout includes DNS, redirects and body reads.
-poll_interval_seconds = 30
-connect_timeout_seconds = 5
-total_timeout_seconds = 10
-# Consecutive observations required to confirm DOWN or RECOVERY.
-failure_confirmation = 3
-recovery_confirmation = 2
-# Reminders need an accepted opening alert and a fresh, ongoing incident.
-reminder_interval_seconds = 1800
-# Body limit for marker validation, applied to encoded and decoded bytes.
-max_body_bytes = 65536
-# Disabled entries are validated but not polled; monitor mode needs one enabled site.
-enabled = true
+# Relative to this TOML file; do not also define inline [[sites]] tables here.
+sites_file = "checks.example.toml"
