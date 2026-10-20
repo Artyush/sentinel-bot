@@ -1,0 +1,15 @@
+# Production email-only monitoring. Export credentials and destinations from .env.
+# Configuration reference: ../docs/configuration.md
+[runtime]
+mode = "monitor"
+state_dir = "data"
+sites_file = "checks.example.toml"
+
+[email]
+enabled = true
+provider = "mailchimp"
+request_timeout_seconds = 10
+
+# Telegram can be enabled independently; its environment variables are then required.
+[telegram]
+enabled = false

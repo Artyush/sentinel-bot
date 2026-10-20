@@ -272,6 +272,17 @@ def render_command(command: Command, snapshot: Mapping[str, object], *, now: dat
             "webhook",
         ):
             lines.append(f"Telegram error: {error}")
+    email = _mapping(snapshot.get("email"))
+    if email and email.get("enabled") is True:
+        lines.append(
+            "Email: "
+            + "; ".join(
+                f"{key}={_count(email.get(key))}"
+                for key in ("pending", "retrying", "failed", "blocked", "accepted")
+            )
+        )
+        if email.get("paused") is True:
+            lines.append("Email delivery is paused.")
     sites = snapshot.get("sites")
     if isinstance(sites, (list, tuple)):
         rows = [_mapping(value) for value in sites[:MAX_SITES]]

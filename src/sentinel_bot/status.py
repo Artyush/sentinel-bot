@@ -16,6 +16,18 @@ def status_snapshot(settings: Settings) -> dict[str, object]:
     now = time.monotonic()
     sites: list[dict[str, object]] = []
     source_modes = {source.alias: source.mode for source in settings.sources}
+    email: dict[str, object] = {
+        "enabled": settings.email is not None,
+        **store.email_delivery_status(),
+    }
+    email["recipients"] = (
+        []
+        if settings.email is None
+        else [
+            {"recipient": f"recipient_{index}", **store.email_delivery_status(destination)}
+            for index, destination in enumerate(settings.email.destinations, start=1)
+        ]
+    )
     for site in settings.sites:
         if not site.enabled:
             continue
@@ -61,6 +73,7 @@ def status_snapshot(settings: Settings) -> dict[str, object]:
         "sites": sites,
         "pending_notifications": store.pending_count(),
         "telegram": {"enabled": settings.telegram is not None, **store.delivery_status()},
+        "email": email,
         "ingress": {"enabled": settings.ingress is not None},
         "sources": [
             {

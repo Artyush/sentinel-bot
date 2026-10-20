@@ -40,3 +40,5 @@ jobs:
         run: python scripts/telegram_smoke.py
       - name: Docker incoming events smoke check
         run: python scripts/ingress_smoke.py
+      - name: Docker email smoke check
+        run: python scripts/email_smoke.py

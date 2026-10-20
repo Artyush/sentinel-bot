@@ -13,6 +13,8 @@
 !config/telegram.example.toml
 !config/checks.example.toml
 !config/ingress.example.toml
+!config/email.example.toml
+!config/email.local.toml
 !demo/
 !demo/site_fixture.py
 src/**/__pycache__/

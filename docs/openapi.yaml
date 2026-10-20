@@ -4,7 +4,7 @@ info:
   version: 1.0.0
   description: >-
     Submit technical events from configured sources. Acceptance means durable SQLite
-    storage, not Telegram delivery. Enable the optional receiver behind your HTTPS proxy.
+    storage for all configured channels, not Telegram or inbox delivery. Enable the optional receiver behind your HTTPS proxy.
 servers:
   - url: https://sentinel.example.test
     description: Replace with your HTTPS reverse proxy URL.
@@ -66,7 +66,7 @@ paths:
                   incident_key: worker-7f829032
       responses:
         '202':
-          description: Receipt, lifecycle decision and required deliveries durably committed.
+          description: Receipt, lifecycle decision and all configured channel deliveries durably committed.
           content:
             application/json:
               schema:

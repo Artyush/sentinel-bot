@@ -30,6 +30,10 @@ def main() -> None:
                 "SENTINEL_TELEGRAM_CHAT_ID": "",
                 "SENTINEL_TELEGRAM_ALLOWED_USER_IDS": "",
                 "SENTINEL_TELEGRAM_TOPIC_ID": "",
+                "SENTINEL_EMAIL_API_KEY": "",
+                "SENTINEL_EMAIL_FROM": "",
+                "SENTINEL_EMAIL_RECIPIENTS": "",
+                "SENTINEL_SOURCE_APP_TOKEN": "",
             }
             result = subprocess.run(
                 [

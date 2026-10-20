@@ -34,12 +34,13 @@ from sentinel_bot.models import (
 from sentinel_bot.policy import apply_observation as decide_observation
 from sentinel_bot.policy import due_reminder
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DATABASE_NAME = "state.sqlite3"
 HISTORY_LIMIT = 200
 MAX_PENDING_NOTIFICATIONS = 80
 MAX_PENDING_PUSH_NOTIFICATIONS = 1000
 MAX_IN_FLIGHT_NOTIFICATIONS = 20
+MAX_IN_FLIGHT_EMAIL = 5
 MAX_RETRY_DELAY_SECONDS = 7 * 86400
 
 
@@ -144,7 +145,7 @@ def _upgrade_schema(connection: sqlite3.Connection) -> None:
                 startup_count INTEGER NOT NULL CHECK (startup_count > 0)
             )"""
         )
-    elif version not in (1, 2, 3, SCHEMA_VERSION):
+    elif version not in (1, 2, 3, 4, SCHEMA_VERSION):
         raise StorageError(f"Unsupported state schema version {version}; expected {SCHEMA_VERSION}")
     if version == 1:
         row = connection.execute(
@@ -159,6 +160,8 @@ def _upgrade_schema(connection: sqlite3.Connection) -> None:
         _create_delivery_schema(connection)
     if version < 4:
         _create_ingress_schema(connection)
+    if version < 5:
+        _create_email_schema(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     for query in (
         "SELECT alias, fingerprint, state, observation, delivery_destination, opening_id, "
@@ -177,10 +180,89 @@ def _upgrade_schema(connection: sqlite3.Connection) -> None:
         "SELECT source_alias, incident_key, event_type, opened_at, resolved_at, retained_at, "
         "destination, opening_id, opening_failed FROM pushed_incidents LIMIT 0",
         "SELECT source_alias, received_at, occurred_at FROM push_sources LIMIT 0",
+        "SELECT destination, enabled FROM email_routes LIMIT 0",
+        "SELECT source_alias, destination, incident_id, opening_id, opening_failed, "
+        "reminder_failed FROM email_site_routes LIMIT 0",
+        "SELECT source_alias, incident_key, destination, opening_id, opening_failed "
+        "FROM email_push_routes LIMIT 0",
+        "SELECT sequence, notification_id, source_alias, destination, incident_id, kind, event, "
+        "in_flight, delivered_at, attempts, next_attempt_at, attempted_at, failed_at, last_error, "
+        "blocked_by, retry_delay_seconds FROM email_outbox LIMIT 0",
+        "SELECT source_alias, destination, incident_id, last_delivered_at "
+        "FROM email_progress LIMIT 0",
+        "SELECT singleton, pause_until, pause_delay_seconds, last_error, suspended "
+        "FROM email_channel LIMIT 0",
     ):
         connection.execute(query)
     if connection.execute("SELECT 1 FROM telegram_route WHERE singleton = 1").fetchone() is None:
         raise StorageError("Telegram route metadata is missing")
+    if connection.execute("SELECT 1 FROM email_channel WHERE singleton = 1").fetchone() is None:
+        raise StorageError("Email channel metadata is missing")
+
+
+def _create_email_schema(connection: sqlite3.Connection) -> None:
+    for statement in (
+        """CREATE TABLE email_routes (
+            destination TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))
+        )""",
+        """CREATE TABLE email_channel (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            pause_until TEXT,
+            pause_delay_seconds REAL,
+            last_error TEXT,
+            suspended INTEGER NOT NULL DEFAULT 0 CHECK (suspended IN (0, 1))
+        )""",
+        "INSERT INTO email_channel (singleton) VALUES (1)",
+        """CREATE TABLE email_outbox (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            notification_id TEXT UNIQUE NOT NULL,
+            source_alias TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            incident_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            event TEXT NOT NULL,
+            in_flight INTEGER NOT NULL DEFAULT 0 CHECK (in_flight IN (0, 1)),
+            delivered_at TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            attempted_at TEXT,
+            failed_at TEXT,
+            last_error TEXT,
+            blocked_by TEXT,
+            retry_delay_seconds REAL
+        )""",
+        "CREATE INDEX pending_email ON email_outbox (source_alias, destination, delivered_at)",
+        """CREATE UNIQUE INDEX one_pending_email_reminder
+        ON email_outbox (source_alias, destination, incident_id)
+        WHERE kind = 'REMINDER' AND delivered_at IS NULL
+        AND failed_at IS NULL AND blocked_by IS NULL""",
+        """CREATE TABLE email_site_routes (
+            source_alias TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            incident_id TEXT NOT NULL,
+            opening_id TEXT NOT NULL,
+            opening_failed INTEGER NOT NULL DEFAULT 0,
+            reminder_failed INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (source_alias, destination)
+        )""",
+        """CREATE TABLE email_push_routes (
+            source_alias TEXT NOT NULL,
+            incident_key TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            opening_id TEXT NOT NULL,
+            opening_failed INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (source_alias, incident_key, destination)
+        )""",
+        """CREATE TABLE email_progress (
+            source_alias TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            incident_id TEXT NOT NULL,
+            last_delivered_at TEXT NOT NULL,
+            PRIMARY KEY (source_alias, destination)
+        )""",
+    ):
+        connection.execute(statement)
 
 
 def _create_ingress_schema(connection: sqlite3.Connection) -> None:
@@ -323,6 +405,15 @@ class OutboxRecord:
     last_error: str | None = None
     blocked_by: str | None = None
     retry_delay_seconds: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EmailDeliverySchedule:
+    id: str
+    destination: str
+    in_flight: bool
+    attempts: int
+    retry_delay_seconds: float | None
 
 
 @dataclass(frozen=True)
@@ -509,6 +600,11 @@ def _safe_error(value: str) -> None:
         "invalid_response",
         "conflict",
         "webhook",
+        "tls",
+        "quota",
+        "rejected",
+        "invalid_recipient",
+        "configuration",
     }:
         raise ValueError("Delivery error must be a normalized category")
 
@@ -584,6 +680,14 @@ class SQLiteStore:
     @staticmethod
     def _cancel_unsent(connection: sqlite3.Connection, alias: str) -> None:
         connection.execute("DELETE FROM delivery_progress WHERE source_alias = ?", (alias,))
+        connection.execute("DELETE FROM email_progress WHERE source_alias = ?", (alias,))
+        connection.execute("DELETE FROM email_site_routes WHERE source_alias = ?", (alias,))
+        connection.execute(
+            """DELETE FROM email_outbox WHERE source_alias = ?
+            AND kind IN ('DOWN', 'RECOVERY', 'REMINDER') AND delivered_at IS NULL
+            AND in_flight = 0 AND attempts = 0 AND failed_at IS NULL AND blocked_by IS NULL""",
+            (alias,),
+        )
         connection.execute(
             """DELETE FROM notification_outbox
             WHERE source_alias = ? AND delivered_at IS NULL AND in_flight = 0
@@ -658,6 +762,8 @@ class SQLiteStore:
 
     @staticmethod
     def _queue_event(connection: sqlite3.Connection, alias: str, event: Event) -> None:
+        if event.kind in (EventKind.DOWN, EventKind.RECOVERY):
+            SQLiteStore._queue_email_site_event(connection, alias, event)
         route = connection.execute(
             "SELECT destination FROM telegram_route WHERE singleton = 1"
         ).fetchone()
@@ -666,6 +772,16 @@ class SQLiteStore:
             "SELECT delivery_destination, opening_id, opening_failed FROM sites WHERE alias = ?",
             (alias,),
         ).fetchone()
+        if event.kind is EventKind.DOWN and (route is None or route[0] is None):
+            if SQLiteStore._active_email_destinations(connection):
+                connection.execute(
+                    "UPDATE sites SET delivery_destination = 'disabled', opening_id = NULL, "
+                    "opening_failed = 0, reminder_failed = 0 WHERE alias = ?",
+                    (alias,),
+                )
+                return
+        elif current is not None and current[0] == "disabled":
+            return
         blocked_by = None
         if event.kind is not EventKind.DOWN and current is not None:
             destination = current[0] or destination
@@ -748,6 +864,12 @@ class SQLiteStore:
             "DELETE FROM pushed_incidents WHERE resolved_at IS NOT NULL AND retained_at < ?",
             (cutoff,),
         )
+        connection.execute(
+            """DELETE FROM email_push_routes WHERE NOT EXISTS (
+                SELECT 1 FROM pushed_incidents AS p WHERE
+                p.source_alias = email_push_routes.source_alias
+                AND p.incident_key = email_push_routes.incident_key)"""
+        )
 
     @staticmethod
     def _event_capacity(
@@ -758,6 +880,7 @@ class SQLiteStore:
         active_delta: int,
         tombstone_delta: int,
         delivery_delta: int,
+        telegram_delivery: bool = True,
     ) -> None:
         for source in (None, alias):
             condition = "" if source is None else " WHERE source_alias = ?"
@@ -774,6 +897,12 @@ class SQLiteStore:
                 "SELECT COUNT(*) FROM notification_outbox "
                 "WHERE kind IN ('NOTIFICATION', 'FIRING', 'RESOLVED') "
                 "AND delivered_at IS NULL AND failed_at IS NULL AND blocked_by IS NULL"
+                + ("" if source is None else " AND source_alias = ?"),
+                values,
+            ).fetchone()[0]
+            telegram_active = connection.execute(
+                "SELECT COUNT(*) FROM pushed_incidents WHERE resolved_at IS NULL "
+                "AND destination != 'disabled'"
                 + ("" if source is None else " AND source_alias = ?"),
                 values,
             ).fetchone()[0]
@@ -800,7 +929,10 @@ class SQLiteStore:
                     (
                         receipts + 1 + active + active_delta,
                         tombstones + tombstone_delta + active + active_delta,
-                        pending + delivery_delta + active + active_delta,
+                        pending
+                        + int(telegram_delivery) * delivery_delta
+                        + telegram_active
+                        + int(telegram_delivery) * active_delta,
                         active + active_delta,
                     ),
                     maxima,
@@ -863,6 +995,16 @@ class SQLiteStore:
             )
             opening = previous is None and event.kind == "firing"
             tombstone = decision.state is not None and decision.state.resolved_at is not None
+            route = connection.execute(
+                "SELECT destination FROM telegram_route WHERE singleton = 1"
+            ).fetchone()
+            current_destination = None if route is None else route[0]
+            email_destinations = self._active_email_destinations(connection)
+            destination = (
+                occurrence["destination"]
+                if occurrence is not None
+                else current_destination or ("disabled" if email_destinations else "operator")
+            )
             if not closing_active:
                 self._event_capacity(
                     connection,
@@ -871,17 +1013,19 @@ class SQLiteStore:
                     active_delta=int(opening),
                     tombstone_delta=int(tombstone and previous is None),
                     delivery_delta=int(decision.notify),
+                    telegram_delivery=destination != "disabled",
                 )
-            route = connection.execute(
-                "SELECT destination FROM telegram_route WHERE singleton = 1"
-            ).fetchone()
-            current_destination = None if route is None else route[0]
-            destination = (
-                occurrence["destination"]
-                if occurrence is not None
-                else current_destination or "operator"
+                self._email_event_capacity(
+                    connection,
+                    source.alias,
+                    limits,
+                    email_destinations,
+                    active_delta=int(opening),
+                    delivery_delta=int(decision.notify),
+                )
+            notification_id = (
+                str(uuid4()) if decision.notify and destination != "disabled" else None
             )
-            notification_id = str(uuid4()) if decision.notify else None
             if decision.state is not None:
                 state = decision.state
                 connection.execute(
@@ -905,13 +1049,7 @@ class SQLiteStore:
                         notification_id if opening else None,
                     ),
                 )
-            if notification_id is not None:
-                blocked_by = (
-                    occurrence["opening_id"]
-                    if closing_active and occurrence is not None and occurrence["opening_failed"]
-                    else None
-                )
-                unavailable = current_destination is not None and destination != current_destination
+            if decision.notify:
                 outgoing = Event(
                     EventKind(event.kind.upper()),
                     event.incident_key or event.event_id,
@@ -924,6 +1062,14 @@ class SQLiteStore:
                     event.event_type,
                     received_at,
                 )
+                self._queue_email_push_event(connection, source.alias, outgoing, opening)
+            if notification_id is not None:
+                blocked_by = (
+                    occurrence["opening_id"]
+                    if closing_active and occurrence is not None and occurrence["opening_failed"]
+                    else None
+                )
+                unavailable = current_destination is not None and destination != current_destination
                 connection.execute(
                     """INSERT INTO notification_outbox
                     (notification_id, source_alias, destination, incident_id, kind, event,
@@ -986,6 +1132,12 @@ class SQLiteStore:
                     "AND delivered_at IS NULL AND failed_at IS NULL AND blocked_by IS NULL",
                     (alias,),
                 ).fetchone()[0]
+                pending += connection.execute(
+                    "SELECT COUNT(*) FROM email_outbox WHERE source_alias = ? "
+                    "AND kind IN ('NOTIFICATION', 'FIRING', 'RESOLVED') "
+                    "AND delivered_at IS NULL AND failed_at IS NULL AND blocked_by IS NULL",
+                    (alias,),
+                ).fetchone()[0]
                 result.append(
                     {
                         "alias": alias,
@@ -1011,8 +1163,10 @@ class SQLiteStore:
     def pending_count(self) -> int:
         with self._transaction() as connection:
             row = connection.execute(
-                "SELECT COUNT(*) FROM notification_outbox WHERE delivered_at IS NULL "
-                "AND failed_at IS NULL AND blocked_by IS NULL"
+                "SELECT (SELECT COUNT(*) FROM notification_outbox WHERE delivered_at IS NULL "
+                "AND failed_at IS NULL AND blocked_by IS NULL) + "
+                "(SELECT COUNT(*) FROM email_outbox WHERE delivered_at IS NULL "
+                "AND failed_at IS NULL AND blocked_by IS NULL)"
             ).fetchone()
             assert row is not None
             return int(row[0])
@@ -1558,3 +1712,615 @@ class SQLiteStore:
                 return False
             self._queue_event(connection, site.alias, event)
             return True
+
+    @staticmethod
+    def _active_email_destinations(connection: sqlite3.Connection) -> tuple[str, ...]:
+        return tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT destination FROM email_routes WHERE enabled = 1 ORDER BY destination"
+            ).fetchall()
+        )
+
+    @staticmethod
+    def _prune_email_history(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """DELETE FROM email_outbox
+            WHERE (delivered_at IS NOT NULL OR failed_at IS NOT NULL OR blocked_by IS NOT NULL)
+            AND sequence NOT IN (SELECT sequence FROM email_outbox
+                WHERE delivered_at IS NOT NULL OR failed_at IS NOT NULL OR blocked_by IS NOT NULL
+                ORDER BY sequence DESC LIMIT ?)""",
+            (HISTORY_LIMIT,),
+        )
+
+    @staticmethod
+    def _insert_email(
+        connection: sqlite3.Connection,
+        alias: str,
+        destination: str,
+        event: Event,
+        *,
+        blocked_by: str | None = None,
+    ) -> str:
+        configured = tuple(
+            row[0] for row in connection.execute("SELECT destination FROM email_routes").fetchall()
+        )
+        unavailable = bool(configured) and destination not in configured
+        notification_id = str(uuid4())
+        connection.execute(
+            """INSERT INTO email_outbox
+            (notification_id, source_alias, destination, incident_id, kind, event,
+            blocked_by, failed_at, last_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                notification_id,
+                alias,
+                destination,
+                event.incident_id,
+                event.kind.value,
+                _encode_event(event),
+                blocked_by,
+                _timestamp(event.occurred_at) if unavailable and blocked_by is None else None,
+                "opening_failed"
+                if blocked_by is not None
+                else "destination_changed"
+                if unavailable
+                else None,
+            ),
+        )
+        SQLiteStore._prune_email_history(connection)
+        return notification_id
+
+    @staticmethod
+    def _queue_email_site_event(connection: sqlite3.Connection, alias: str, event: Event) -> None:
+        if event.kind is EventKind.DOWN:
+            destinations = SQLiteStore._active_email_destinations(connection)
+            connection.execute("DELETE FROM email_progress WHERE source_alias = ?", (alias,))
+            connection.execute("DELETE FROM email_site_routes WHERE source_alias = ?", (alias,))
+            routes = [(destination, None) for destination in destinations]
+        else:
+            routes = [
+                (row["destination"], row["opening_id"] if row["opening_failed"] else None)
+                for row in connection.execute(
+                    "SELECT * FROM email_site_routes WHERE source_alias = ? AND incident_id = ?",
+                    (alias, event.incident_id),
+                ).fetchall()
+            ]
+        configured = tuple(
+            row[0] for row in connection.execute("SELECT destination FROM email_routes").fetchall()
+        )
+        for destination, blocked_by in routes:
+            if event.kind is EventKind.DOWN:
+                connection.execute(
+                    """DELETE FROM email_outbox WHERE source_alias = ? AND destination = ?
+                    AND incident_id != ? AND kind IN ('DOWN', 'RECOVERY', 'REMINDER')
+                    AND delivered_at IS NULL AND in_flight = 0 AND attempts = 0
+                    AND failed_at IS NULL AND blocked_by IS NULL""",
+                    (alias, destination, event.incident_id),
+                )
+            else:
+                connection.execute(
+                    """DELETE FROM email_outbox WHERE source_alias = ? AND destination = ?
+                    AND kind = 'REMINDER' AND delivered_at IS NULL AND in_flight = 0
+                    AND attempts = 0 AND failed_at IS NULL AND blocked_by IS NULL""",
+                    (alias, destination),
+                )
+            pending = connection.execute(
+                "SELECT COUNT(*) FROM email_outbox WHERE destination = ? "
+                "AND kind IN ('DOWN', 'RECOVERY', 'REMINDER') AND delivered_at IS NULL "
+                "AND failed_at IS NULL AND blocked_by IS NULL",
+                (destination,),
+            ).fetchone()[0]
+            if (
+                blocked_by is None
+                and (not configured or destination in configured)
+                and pending >= MAX_PENDING_NOTIFICATIONS
+            ):
+                raise StorageError("Email notification outbox capacity is exhausted")
+            notification_id = SQLiteStore._insert_email(
+                connection, alias, destination, event, blocked_by=blocked_by
+            )
+            if event.kind is EventKind.DOWN:
+                connection.execute(
+                    """INSERT INTO email_site_routes
+                    (source_alias, destination, incident_id, opening_id) VALUES (?, ?, ?, ?)""",
+                    (alias, destination, event.incident_id, notification_id),
+                )
+
+    @staticmethod
+    def _email_event_capacity(
+        connection: sqlite3.Connection,
+        alias: str,
+        limits: IngressSettings,
+        destinations: Sequence[str],
+        *,
+        active_delta: int,
+        delivery_delta: int,
+    ) -> None:
+        for destination in destinations:
+            for source in (None, alias):
+                condition = "" if source is None else " AND source_alias = ?"
+                values = (destination,) if source is None else (destination, source)
+                pending = connection.execute(
+                    "SELECT COUNT(*) FROM email_outbox WHERE destination = ? "
+                    "AND kind IN ('NOTIFICATION', 'FIRING', 'RESOLVED') "
+                    "AND delivered_at IS NULL AND failed_at IS NULL AND blocked_by IS NULL"
+                    + condition,
+                    values,
+                ).fetchone()[0]
+                active = connection.execute(
+                    "SELECT COUNT(*) FROM email_push_routes AS r JOIN pushed_incidents AS p "
+                    "ON p.source_alias = r.source_alias AND p.incident_key = r.incident_key "
+                    "WHERE r.destination = ? AND p.resolved_at IS NULL"
+                    + ("" if source is None else " AND r.source_alias = ?"),
+                    values,
+                ).fetchone()[0]
+                maximum = limits.max_pending if source is None else limits.max_pending_per_source
+                if pending + delivery_delta + active + active_delta > maximum:
+                    raise EventRejected("capacity")
+
+    @staticmethod
+    def _queue_email_push_event(
+        connection: sqlite3.Connection, alias: str, event: Event, opening: bool
+    ) -> None:
+        if event.kind is EventKind.RESOLVED:
+            routes = [
+                (row["destination"], row["opening_id"] if row["opening_failed"] else None)
+                for row in connection.execute(
+                    "SELECT * FROM email_push_routes WHERE source_alias = ? AND incident_key = ?",
+                    (alias, event.incident_id),
+                ).fetchall()
+            ]
+        else:
+            routes = [
+                (destination, None)
+                for destination in SQLiteStore._active_email_destinations(connection)
+            ]
+        for destination, blocked_by in routes:
+            notification_id = SQLiteStore._insert_email(
+                connection, alias, destination, event, blocked_by=blocked_by
+            )
+            if opening:
+                connection.execute(
+                    """INSERT INTO email_push_routes
+                    (source_alias, incident_key, destination, opening_id) VALUES (?, ?, ?, ?)""",
+                    (alias, event.incident_id, destination, notification_id),
+                )
+
+    def configure_email(self, destinations: Sequence[str], now: datetime) -> int:
+        """Restore interrupted attempts and bind only operator-owned opaque routes.
+
+        An empty route set pauses saved deliveries. A changed nonempty set fails
+        removed destinations instead of rerouting their accepted incident history.
+        """
+        keys = tuple(destinations)
+        if (
+            len(keys) > 5
+            or len(set(keys)) != len(keys)
+            or any(re.fullmatch(r"email:[0-9a-f]{64}", key) is None for key in keys)
+        ):
+            raise ValueError("Email requires at most five unique opaque destinations")
+        timestamp = _timestamp(now)
+        with self._transaction() as connection:
+            interrupted = connection.execute(
+                "SELECT COUNT(*) FROM email_outbox WHERE in_flight = 1 "
+                "AND delivered_at IS NULL AND failed_at IS NULL AND blocked_by IS NULL"
+            ).fetchone()[0]
+            connection.execute(
+                """UPDATE email_outbox SET in_flight = 0, attempts = MAX(attempts, 1),
+                next_attempt_at = ?, last_error = 'interrupted' WHERE in_flight = 1
+                AND delivered_at IS NULL AND failed_at IS NULL AND blocked_by IS NULL""",
+                (timestamp,),
+            )
+            if keys:
+                connection.execute("UPDATE email_channel SET suspended = 0 WHERE singleton = 1")
+                rows = connection.execute(
+                    "SELECT * FROM email_outbox WHERE delivered_at IS NULL "
+                    "AND failed_at IS NULL AND blocked_by IS NULL ORDER BY sequence"
+                ).fetchall()
+                for row in rows:
+                    if row["destination"] not in keys:
+                        self._fail_email(connection, row, timestamp, "destination_changed")
+                connection.execute("DELETE FROM email_routes")
+                connection.executemany(
+                    "INSERT INTO email_routes VALUES (?, 1)", ((key,) for key in keys)
+                )
+                for destination in keys:
+                    connection.execute(
+                        """DELETE FROM email_outbox AS old
+                        WHERE old.destination = ? AND old.delivered_at IS NULL
+                        AND old.kind IN ('DOWN', 'RECOVERY', 'REMINDER')
+                        AND old.failed_at IS NULL AND old.blocked_by IS NULL
+                        AND old.in_flight = 0 AND old.attempts = 0
+                        AND EXISTS (SELECT 1 FROM email_outbox AS latest
+                            WHERE latest.source_alias = old.source_alias
+                            AND latest.destination = old.destination AND latest.kind = 'DOWN'
+                            AND latest.sequence = (SELECT MAX(sequence) FROM email_outbox
+                                WHERE source_alias = old.source_alias
+                                AND destination = old.destination AND kind = 'DOWN')
+                            AND latest.incident_id != old.incident_id)""",
+                        (destination,),
+                    )
+            else:
+                connection.execute("UPDATE email_routes SET enabled = 0")
+            self._prune_email_history(connection)
+            return int(interrupted)
+
+    def pending_email_notifications(self) -> tuple[OutboxRecord, ...]:
+        with self._transaction() as connection:
+            return tuple(
+                _outbox_record(row)
+                for row in connection.execute(
+                    "SELECT * FROM email_outbox WHERE delivered_at IS NULL "
+                    "AND failed_at IS NULL AND blocked_by IS NULL ORDER BY sequence"
+                ).fetchall()
+            )
+
+    def email_pending_schedule(self) -> tuple[EmailDeliverySchedule, ...]:
+        """Read bounded retry metadata without loading or decoding event payloads."""
+        maximum = 5 * (MAX_PENDING_NOTIFICATIONS + MAX_PENDING_PUSH_NOTIFICATIONS)
+        with self._transaction() as connection:
+            rows = connection.execute(
+                "SELECT notification_id, destination, in_flight, attempts, retry_delay_seconds "
+                "FROM email_outbox WHERE delivered_at IS NULL "
+                "AND failed_at IS NULL AND blocked_by IS NULL ORDER BY sequence LIMIT ?",
+                (maximum + 1,),
+            ).fetchall()
+            if len(rows) > maximum:
+                raise StorageError("Email notification outbox exceeds its capacity")
+            return tuple(
+                EmailDeliverySchedule(row[0], row[1], bool(row[2]), row[3], row[4]) for row in rows
+            )
+
+    def email_pending_count(self) -> int:
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM email_outbox WHERE delivered_at IS NULL "
+                "AND failed_at IS NULL AND blocked_by IS NULL"
+            ).fetchone()
+            assert row is not None
+            return int(row[0])
+
+    def reserve_due_email_delivery(
+        self, now: datetime, *, ready_ids: Sequence[str] | None = None
+    ) -> OutboxRecord | None:
+        """Persist one per-recipient attempt without blocking other recipients."""
+        timestamp = _timestamp(now)
+        if ready_ids is not None and len(ready_ids) > 5 * (
+            MAX_PENDING_NOTIFICATIONS + MAX_PENDING_PUSH_NOTIFICATIONS
+        ):
+            raise ValueError("Too many email delivery candidates")
+        with self._transaction() as connection:
+            in_flight = connection.execute(
+                "SELECT COUNT(*) FROM email_outbox WHERE in_flight = 1 "
+                "AND delivered_at IS NULL AND failed_at IS NULL AND blocked_by IS NULL"
+            ).fetchone()[0]
+            if in_flight >= MAX_IN_FLIGHT_EMAIL:
+                return None
+            candidates = connection.execute(
+                """SELECT o.notification_id, o.next_attempt_at FROM email_outbox AS o
+                JOIN email_routes AS r
+                ON r.enabled = 1 AND o.destination = r.destination
+                JOIN email_channel AS c ON c.singleton = 1 AND c.suspended = 0
+                WHERE o.delivered_at IS NULL AND o.failed_at IS NULL AND o.blocked_by IS NULL
+                AND o.in_flight = 0 AND NOT EXISTS (
+                    SELECT 1 FROM email_outbox AS earlier
+                    WHERE earlier.source_alias = o.source_alias
+                    AND earlier.destination = o.destination AND earlier.sequence < o.sequence
+                    AND earlier.delivered_at IS NULL AND earlier.failed_at IS NULL
+                    AND earlier.blocked_by IS NULL) ORDER BY o.sequence"""
+            ).fetchall()
+            row = next(
+                (
+                    row
+                    for row in candidates
+                    if (
+                        row["notification_id"] in ready_ids
+                        if ready_ids is not None
+                        else row["next_attempt_at"] is None or row["next_attempt_at"] <= timestamp
+                    )
+                ),
+                None,
+            )
+            if row is None:
+                return None
+            connection.execute(
+                "UPDATE email_outbox SET in_flight = 1, attempts = attempts + 1, "
+                "attempted_at = ?, next_attempt_at = NULL WHERE notification_id = ?",
+                (timestamp, row["notification_id"]),
+            )
+            updated = connection.execute(
+                "SELECT * FROM email_outbox WHERE notification_id = ?", (row["notification_id"],)
+            ).fetchone()
+            assert updated is not None
+            return _outbox_record(updated)
+
+    def retry_email_delivery(
+        self,
+        notification_id: str,
+        next_at: datetime,
+        error: str,
+        *,
+        delay_seconds: float | None = None,
+    ) -> None:
+        """Release a failed attempt while preserving its independent retry clock."""
+        timestamp = _timestamp(next_at)
+        _safe_error(error)
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT attempted_at FROM email_outbox WHERE notification_id = ?",
+                (notification_id,),
+            ).fetchone()
+            attempted = None if row is None else _optional_datetime(row[0])
+            delay = _retry_delay(
+                (0 if attempted is None else max(0, (next_at - attempted).total_seconds()))
+                if delay_seconds is None
+                else delay_seconds
+            )
+            changed = connection.execute(
+                """UPDATE email_outbox SET in_flight = 0, next_attempt_at = ?,
+                last_error = ?, retry_delay_seconds = ? WHERE notification_id = ?
+                AND in_flight = 1 AND delivered_at IS NULL
+                AND failed_at IS NULL AND blocked_by IS NULL""",
+                (timestamp, error, delay, notification_id),
+            )
+            if changed.rowcount != 1:
+                raise StorageError("An in-flight email notification is required for retry")
+
+    @staticmethod
+    def _fail_email(
+        connection: sqlite3.Connection, row: sqlite3.Row, timestamp: str, error: str
+    ) -> None:
+        changed = connection.execute(
+            """UPDATE email_outbox SET in_flight = 0, failed_at = ?,
+            next_attempt_at = NULL, last_error = ? WHERE notification_id = ?
+            AND delivered_at IS NULL AND failed_at IS NULL AND blocked_by IS NULL""",
+            (timestamp, error, row["notification_id"]),
+        )
+        if changed.rowcount == 0:
+            return
+        if row["kind"] in (EventKind.DOWN.value, EventKind.FIRING.value):
+            table = (
+                "email_site_routes" if row["kind"] == EventKind.DOWN.value else "email_push_routes"
+            )
+            connection.execute(
+                f"UPDATE {table} SET opening_failed = 1 WHERE opening_id = ?",
+                (row["notification_id"],),
+            )
+            kinds = (
+                "('RECOVERY', 'REMINDER')"
+                if row["kind"] == EventKind.DOWN.value
+                else "('RESOLVED')"
+            )
+            connection.execute(
+                "UPDATE email_outbox SET blocked_by = ?, in_flight = 0, "
+                "next_attempt_at = NULL, last_error = 'opening_failed' "
+                "WHERE source_alias = ? AND destination = ? AND incident_id = ? "
+                f"AND kind IN {kinds} AND delivered_at IS NULL "
+                "AND failed_at IS NULL AND in_flight = 0",
+                (
+                    row["notification_id"],
+                    row["source_alias"],
+                    row["destination"],
+                    row["incident_id"],
+                ),
+            )
+        elif row["kind"] == EventKind.REMINDER.value:
+            connection.execute(
+                "UPDATE email_site_routes SET reminder_failed = 1 WHERE source_alias = ? "
+                "AND destination = ? AND incident_id = ?",
+                (row["source_alias"], row["destination"], row["incident_id"]),
+            )
+
+    def fail_email_delivery(self, notification_id: str, failed_at: datetime, error: str) -> None:
+        """Persist a terminal destination outcome and dependent lifecycle blockers."""
+        timestamp = _timestamp(failed_at)
+        _safe_error(error)
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM email_outbox WHERE notification_id = ?", (notification_id,)
+            ).fetchone()
+            if row is None or row["delivered_at"] is not None or row["blocked_by"] is not None:
+                raise StorageError("Pending email notification does not exist")
+            if row["failed_at"] is None:
+                self._fail_email(connection, row, timestamp, error)
+            self._prune_email_history(connection)
+
+    def acknowledge_email(self, notification_id: str, delivered_at: datetime) -> None:
+        """Complete only this accepted recipient; no other recipient is retried."""
+        timestamp = _timestamp(delivered_at)
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM email_outbox WHERE notification_id = ?", (notification_id,)
+            ).fetchone()
+            if row is None:
+                raise StorageError("Email notification does not exist")
+            if row["delivered_at"] is not None:
+                return
+            if row["failed_at"] is not None or row["blocked_by"] is not None:
+                raise StorageError("A terminal email notification cannot be acknowledged")
+            earlier = connection.execute(
+                "SELECT 1 FROM email_outbox WHERE source_alias = ? AND destination = ? "
+                "AND delivered_at IS NULL AND failed_at IS NULL AND blocked_by IS NULL "
+                "AND sequence < ? LIMIT 1",
+                (row["source_alias"], row["destination"], row["sequence"]),
+            ).fetchone()
+            if earlier is not None:
+                raise StorageError("An earlier email notification must be delivered first")
+            connection.execute(
+                "UPDATE email_outbox SET delivered_at = ?, in_flight = 0 WHERE notification_id = ?",
+                (timestamp, notification_id),
+            )
+            event = _outbox_record(row).event
+            current = connection.execute(
+                "SELECT 1 FROM email_site_routes WHERE source_alias = ? "
+                "AND destination = ? AND incident_id = ?",
+                (row["source_alias"], row["destination"], event.incident_id),
+            ).fetchone()
+            if current is not None and event.kind in (EventKind.DOWN, EventKind.REMINDER):
+                connection.execute(
+                    """INSERT INTO email_progress VALUES (?, ?, ?, ?)
+                    ON CONFLICT(source_alias, destination) DO UPDATE SET
+                    incident_id = excluded.incident_id, last_delivered_at = excluded.last_delivered_at""",
+                    (row["source_alias"], row["destination"], event.incident_id, timestamp),
+                )
+            self._prune_email_history(connection)
+
+    def email_reminder_progress(self) -> tuple[ReminderRecord, ...]:
+        with self._transaction() as connection:
+            return tuple(
+                ReminderRecord(row[0], row[1], row[2], _datetime(row[3]))
+                for row in connection.execute(
+                    """SELECT p.source_alias, p.destination, p.incident_id, p.last_delivered_at
+                    FROM email_progress AS p JOIN email_site_routes AS r
+                    ON r.source_alias = p.source_alias AND r.destination = p.destination
+                    AND r.incident_id = p.incident_id JOIN sites AS s ON s.alias = p.source_alias
+                    WHERE p.incident_id = json_extract(s.state, '$.incident_id')
+                    ORDER BY p.source_alias, p.destination"""
+                ).fetchall()
+            )
+
+    def queue_email_reminder(
+        self,
+        site: SiteConfig,
+        destination: str,
+        now: datetime,
+        fresh: bool,
+        *,
+        due: bool | None = None,
+    ) -> bool:
+        """Queue one fresh reminder using this recipient's accepted delivery clock."""
+        with self._transaction() as connection:
+            record = self._read_site(connection, site.alias)
+            if record.fingerprint != site.fingerprint or not site.enabled:
+                raise StorageError("Source configuration was not reconciled")
+            route = connection.execute(
+                """SELECT r.* FROM email_site_routes AS r JOIN email_routes AS c
+                ON c.destination = r.destination AND c.enabled = 1
+                WHERE r.source_alias = ? AND r.destination = ? AND r.incident_id = ?""",
+                (site.alias, destination, record.state.incident_id),
+            ).fetchone()
+            if route is None or route["opening_failed"] or route["reminder_failed"]:
+                return False
+            pending = connection.execute(
+                "SELECT 1 FROM email_outbox WHERE source_alias = ? AND destination = ? "
+                "AND kind = 'REMINDER' AND delivered_at IS NULL AND failed_at IS NULL "
+                "AND blocked_by IS NULL LIMIT 1",
+                (site.alias, destination),
+            ).fetchone()
+            if pending is not None:
+                return False
+            last = connection.execute(
+                "SELECT last_delivered_at FROM email_progress WHERE source_alias = ? "
+                "AND destination = ? AND incident_id = ?",
+                (site.alias, destination, record.state.incident_id),
+            ).fetchone()
+            if due is None:
+                event = due_reminder(
+                    record.state,
+                    now,
+                    None if last is None else _datetime(last[0]),
+                    site.reminder_interval,
+                    fresh,
+                )
+            elif due and fresh and last is not None and record.state.confirmed is SiteState.DOWN:
+                assert record.state.incident_id is not None
+                assert record.state.incident_started_at is not None
+                event = Event(
+                    EventKind.REMINDER,
+                    record.state.incident_id,
+                    now,
+                    record.state.incident_started_at,
+                )
+            else:
+                event = None
+            if event is None:
+                return False
+            pending_count = connection.execute(
+                "SELECT COUNT(*) FROM email_outbox WHERE destination = ? "
+                "AND kind IN ('DOWN', 'RECOVERY', 'REMINDER') AND delivered_at IS NULL "
+                "AND failed_at IS NULL AND blocked_by IS NULL",
+                (destination,),
+            ).fetchone()[0]
+            if pending_count >= MAX_PENDING_NOTIFICATIONS:
+                return False
+            self._insert_email(connection, site.alias, destination, event)
+            return True
+
+    def get_email_pause(self) -> tuple[datetime, float] | None:
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT pause_until, pause_delay_seconds FROM email_channel WHERE singleton = 1"
+            ).fetchone()
+            if row is None or row[0] is None:
+                return None
+            return _datetime(row[0]), _retry_delay(row[1])
+
+    def set_email_pause(self, until: datetime, delay_seconds: float) -> None:
+        timestamp = _timestamp(until)
+        delay = _retry_delay(delay_seconds)
+        with self._transaction() as connection:
+            connection.execute(
+                "UPDATE email_channel SET pause_until = ?, pause_delay_seconds = ? WHERE singleton = 1",
+                (timestamp, delay),
+            )
+
+    def clear_email_pause(self) -> None:
+        with self._transaction() as connection:
+            connection.execute(
+                "UPDATE email_channel SET pause_until = NULL, pause_delay_seconds = NULL "
+                "WHERE singleton = 1"
+            )
+
+    def set_email_error(self, error: str | None) -> None:
+        if error is not None:
+            _safe_error(error)
+        with self._transaction() as connection:
+            connection.execute(
+                "UPDATE email_channel SET last_error = ? WHERE singleton = 1", (error,)
+            )
+
+    def set_email_suspended(self, suspended: bool) -> None:
+        """Pause a misconfigured provider without failing other destinations."""
+        if type(suspended) is not bool:
+            raise ValueError("Email suspension must be a boolean")
+        with self._transaction() as connection:
+            connection.execute(
+                "UPDATE email_channel SET suspended = ? WHERE singleton = 1", (int(suspended),)
+            )
+
+    def email_delivery_status(self, destination: str | None = None) -> dict[str, int | str | None]:
+        """Expose channel counters and categories without addresses or route keys."""
+        with self._transaction() as connection:
+            row = connection.execute(
+                """SELECT COUNT(*) FILTER (WHERE delivered_at IS NULL AND failed_at IS NULL
+                    AND blocked_by IS NULL) AS pending,
+                COUNT(*) FILTER (WHERE delivered_at IS NULL AND failed_at IS NULL
+                    AND blocked_by IS NULL AND attempts > 0) AS retrying,
+                COUNT(*) FILTER (WHERE delivered_at IS NULL AND failed_at IS NOT NULL) AS failed,
+                COUNT(*) FILTER (WHERE delivered_at IS NULL AND blocked_by IS NOT NULL) AS blocked,
+                COUNT(*) FILTER (WHERE delivered_at IS NOT NULL) AS accepted,
+                    COUNT(*) FILTER (WHERE in_flight = 1) AS in_flight FROM email_outbox"""
+                + ("" if destination is None else " WHERE destination = ?"),
+                () if destination is None else (destination,),
+            ).fetchone()
+            assert row is not None
+            result: dict[str, int | str | None] = dict(row)
+            last = connection.execute(
+                "SELECT last_error FROM email_outbox WHERE last_error IS NOT NULL "
+                + ("" if destination is None else "AND destination = ? ")
+                + "ORDER BY COALESCE(failed_at, attempted_at, next_attempt_at) DESC, "
+                "sequence DESC LIMIT 1",
+                () if destination is None else (destination,),
+            ).fetchone()
+            result["last_error"] = None if last is None else str(last[0])
+            channel = connection.execute(
+                "SELECT pause_until, last_error, suspended FROM email_channel WHERE singleton = 1"
+            ).fetchone()
+            if channel is not None and channel[1] is not None:
+                result["last_error"] = str(channel[1])
+            result["paused"] = (
+                not bool(self._active_email_destinations(connection))
+                or channel is not None
+                and (channel[0] is not None or bool(channel[2]))
+            )
+            return result
