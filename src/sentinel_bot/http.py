@@ -154,15 +154,25 @@ class HttpChecker:
         timeout = aiohttp.ClientTimeout(
             total=None, connect=site.connect_timeout, sock_connect=site.connect_timeout
         )
+        headers = {"Content-Type": "application/json"} if site.request_body is not None else None
         for redirect_count in range(_MAX_REDIRECTS + 1):
             self._validate_target(target)
-            async with session.get(target, allow_redirects=False, timeout=timeout) as response:
+            async with session.request(
+                site.method,
+                target,
+                data=site.request_body,
+                headers=headers,
+                allow_redirects=False,
+                timeout=timeout,
+            ) as response:
                 status = response.status
                 if not 100 <= status <= 599:
                     response.close()
                     return self._result(started, False, ErrorKind.HTTP_STATUS, None)
                 try:
                     if status in _REDIRECT_STATUSES:
+                        if site.method == "POST":
+                            return self._result(started, False, ErrorKind.REDIRECT, status)
                         location = response.headers.get("Location")
                         if location is None or redirect_count == _MAX_REDIRECTS:
                             return self._result(started, False, ErrorKind.REDIRECT, status)

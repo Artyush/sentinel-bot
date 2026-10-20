@@ -6,7 +6,7 @@ Website monitoring, Telegram delivery and cached commands are implemented. Incom
 
 ## Configuration loading
 
-The inventory must be valid UTF-8 TOML, at most **16 KiB**. Only `[runtime]`, optional `[telegram]` and repeated `[[sites]]` tables are accepted. Unknown sections or keys fail validation. Durations accept finite integers or floats; counts require integers, not booleans. All ranges below are inclusive unless stated otherwise.
+The main configuration must be valid UTF-8 TOML, at most **16 KiB**. Only `[runtime]`, optional `[telegram]` and optional inline `[[sites]]` tables are accepted. Set `runtime.sites_file` to load endpoint tables from a separate file instead; each file has its own 16 KiB limit. Unknown sections or keys fail validation. Durations accept finite integers or floats; counts require integers, not booleans. All ranges below are inclusive unless stated otherwise.
 
 Native configuration selection, from highest to lowest priority:
 
@@ -24,12 +24,15 @@ The supplied image contains these inventories:
 | [config/sites.example.toml](../config/sites.example.toml) | `/app/config/sites.example.toml` | Public website monitoring |
 | [config/telegram.example.toml](../config/telegram.example.toml) | `/app/config/telegram.example.toml` | Public website monitoring with Telegram enabled |
 | [config/demo.toml](../config/demo.toml) | `/app/config/demo.toml` | Isolated synthetic websites |
+| [config/checks.example.toml](../config/checks.example.toml) | `/app/config/checks.example.toml` | Shared endpoint tables; not a standalone main configuration |
 
-Compose selects `/app/config.toml` by default. Set `SENTINEL_CONTAINER_CONFIG` to another **container path in this table**. `compose.monitoring.yaml` explicitly selects `/app/config/demo.toml` instead. Host paths and arbitrary new TOML files are not mounted or copied automatically; a native `--config` can select another readable file, but the supplied Docker packaging includes only the listed examples. Rebuild after editing a packaged inventory.
+Compose selects `/app/config.toml` by default. Set `SENTINEL_CONTAINER_CONFIG` to another **main configuration path in this table**, not the endpoint-only `checks.example.toml`. `compose.monitoring.yaml` explicitly selects `/app/config/demo.toml` instead. Host paths and arbitrary new TOML files are not mounted or copied automatically; a native `--config` can select another readable file, but the supplied Docker packaging includes only the listed examples. Rebuild after editing a packaged configuration or endpoint inventory.
 
 ## Complete website example
 
-This configuration shows every supported runtime and website field. The public URL and marker are illustrative; choose a read-only page and stable text appropriate to your own service. To disable content matching, omit `marker` entirely.
+These two files show the runtime settings and website fields. The supplied website and Telegram configurations share [config/checks.example.toml](../config/checks.example.toml), so changing their endpoint inventory does not require duplicating it. The public URL and marker are illustrative; choose a repeatedly safe endpoint and stable text appropriate to your own service. To disable content matching, omit `marker` entirely.
+
+Main configuration, such as `config/sites.example.toml`:
 
 ```toml
 [runtime]
@@ -39,13 +42,19 @@ heartbeat_interval_seconds = 1.0
 health_timeout_seconds = 5.0
 shutdown_timeout_seconds = 5.0
 max_concurrency = 5
+sites_file = "checks.example.toml"
 
 [telegram]
 enabled = false
+```
 
+Endpoint inventory, `config/checks.example.toml`, relative to the main configuration's directory:
+
+```toml
 [[sites]]
 alias = "public_site"
 url = "https://example.com/"
+method = "GET"
 marker = "Example Domain"
 status_min = 200
 status_max = 399
@@ -59,6 +68,8 @@ max_body_bytes = 65536
 enabled = true
 ```
 
+The endpoint file accepts only repeated `[[sites]]` tables. Do not place `[runtime]`, `[telegram]` or another file include in it. Inline `[[sites]]` in a main configuration remains supported: omit `runtime.sites_file` and put the endpoint tables after the main settings. Combining an external inventory with any inline `sites` field is invalid, even when the inline list is empty. There is no merge or recursive inclusion.
+
 ### `[runtime]`
 
 | Key | Default | Accepted value and effect |
@@ -69,6 +80,7 @@ enabled = true
 | `health_timeout_seconds` | `5.0` | `0.2`–`300`; must be at least twice `heartbeat_interval_seconds` |
 | `shutdown_timeout_seconds` | `5.0` | `0.1`–`30`; application worker shutdown deadline |
 | `max_concurrency` | `5` | Integer `1`–`5`; shared simultaneous website request limit |
+| `sites_file` | Omitted | Optional nonempty relative inventory path, at most 2,048 characters, resolved from the main configuration's directory. Absolute paths, `..` segments, backslashes, NUL/control characters and paths/symlinks escaping that directory are rejected. Cannot be combined with inline `[[sites]]`. |
 
 `idle` permits no enabled sites and can optionally run Telegram alone. `monitor` requires at least one enabled site. `demo` also requires an enabled site, permits only the named synthetic website origin and rejects enabled live Telegram. Disabled site rows remain subject to validation in every mode.
 
@@ -76,12 +88,14 @@ The default Compose shutdown grace period is 15 seconds. If you raise the applic
 
 ## Website checks: sites
 
-At most **20 rows**, including disabled rows, are accepted. Aliases must be unique across all rows. Repeat the complete table for each website.
+At most **20 rows**, including disabled rows, are accepted from the selected inline or external inventory. Aliases must be unique across all rows. Each table is one independently scheduled endpoint; multiple URLs on the same service can have separate aliases, intervals, confirmation rules and incidents.
 
 | Key | Default | Accepted value and effect |
 | --- | --- | --- |
 | `alias` | Required | 1–32 ASCII characters matching `[A-Za-z][A-Za-z0-9_-]{0,31}` |
 | `url` | Required | Bounded HTTP(S) URL under the address policy below; at most 2,048 characters |
+| `method` | `"GET"` | Exactly `"GET"` or `"POST"`; other methods and lowercase names are rejected |
+| `json_body` | Omitted | Optional JSON-compatible TOML table for POST only. Encoded as canonical UTF-8 JSON, at most 4,096 bytes; top-level arrays/scalars and non-JSON values are rejected. Omit for a bodyless POST; GET forbids this field, including an empty table. |
 | `marker` | Omitted | Nonempty, case-sensitive UTF-8 substring required in the response body; at most `min(max_body_bytes, 4096)` UTF-8 bytes |
 | `status_min` | `200` | Integer `100`–`599`; lowest accepted final HTTP status |
 | `status_max` | `399` | Integer `status_min`–`599`; highest accepted final HTTP status |
@@ -96,11 +110,31 @@ At most **20 rows**, including disabled rows, are accepted. Aliases must be uniq
 
 ### URL and marker behavior
 
-Live URLs use ports **80 or 443**, public addresses and verified TLS for HTTPS. Credentials, query strings, fragments, backslashes, ASCII whitespace/control characters, localhost and private/reserved addresses are rejected. Every connection validates all DNS answers. At most three redirects are followed, only within the same origin: scheme, host and effective port. There is no insecure-TLS, private-host, proxy, authentication-header or arbitrary-port option for website checks. Demo mode permits only `http://site-fixture:8080`, reached through the synthetic Compose network.
+Live URLs use ports **80 or 443**, public addresses and verified TLS for HTTPS. Credentials, query strings, fragments, backslashes, ASCII whitespace/control characters, localhost and private/reserved addresses are rejected. Every connection validates all DNS answers. GET follows at most three redirects, only within the same origin: scheme, host and effective port. POST never follows/replays redirects; HTTP 301, 302, 303, 307 and 308 fail with `redirect`, including when the configured successful status range includes that code. There is no insecure-TLS, private-host, proxy, authentication-header or arbitrary-port option for website checks. Demo mode permits only `http://site-fixture:8080`, reached through the synthetic Compose network.
 
 A marker is a literal substring of the UTF-8 response body, not a regular expression, CSS selector or JavaScript check. It must fit within the configured body limit. Empty `marker = ""` is invalid. Omit the key when HTTP status alone is sufficient; in that case the checker closes the response without reading the body. Marker checks support identity, gzip and deflate encoding, with encoded and decoded sizes each bounded. Invalid UTF-8, unsupported/invalid encoding or missing text fails the marker check; an oversized body reports `body_limit`.
 
 The first successful reading sets UP without a recovery notification. Consecutive confirmations determine later DOWN/RECOVERY transitions. Missing/restored readings remain stale until a new check completes. Freshness lasts `2 × poll_interval_seconds + total_timeout_seconds`. Website worker health allows `2 × poll_interval_seconds + 2 × total_timeout_seconds`, including a separately bounded shared-slot wait. Exhausted local request capacity defers a check and resets pending confirmations; it does not invent a website failure.
+
+### POST health probes
+
+Add a separate endpoint table for a public health probe that is safe to repeat:
+
+```toml
+[[sites]]
+alias = "api_probe"
+url = "https://example.com/health/probe"
+method = "POST"
+json_body = { probe = "availability" }
+poll_interval_seconds = 60
+status_min = 200
+status_max = 299
+enabled = false
+```
+
+Replace the illustrative URL and explicitly enable it only when the endpoint is designed for repeated probes. The supplied POST example is disabled and sends nothing. It must not create orders, payments, accounts or other business actions. Requests run on the endpoint's polling interval, without an immediate transport retry; a timeout leaves the remote outcome unknown and does not guarantee the server did no work. This is periodic availability checking, not a transactional workflow or API client with login/headers/secrets.
+
+`json_body` may contain JSON objects, arrays, strings, finite numbers and booleans supported by TOML; TOML date/time values and non-finite floats are invalid. The top level must be an object. Serialization sorts object keys, removes optional whitespace and preserves UTF-8 text; the 4,096-byte limit includes the complete serialized body. Content-Type is `application/json` only when a JSON body is present. Omitting the field sends a POST without a JSON body. JSON responses can be checked by literal `marker` text only; there is no JSON-path assertion.
 
 ## Telegram
 
@@ -172,8 +206,8 @@ The following application limits are not configurable TOML or environment fields
 
 | Area | Current behavior |
 | --- | --- |
-| Inventory/file bounds | 20 site rows, 16 KiB inventory, 32-character aliases; upper limits cannot be raised through config |
-| Website redirects | At most 3, same origin only |
+| Inventory/file bounds | 20 site rows, 16 KiB per main/inventory file, 32-character aliases, 4,096-byte POST JSON body; upper limits cannot be raised through config |
+| Website redirects | GET: at most 3, same origin only. POST: no redirect follow/replay. |
 | Durable delivery queue | At most 80 pending and 20 in-flight records; capacity failure rolls back the new observation/transition |
 | History | At most 200 terminal delivery records and 200 incident-audit records; not a complete outage archive |
 | Telegram send pacing | One FIFO sender; at least 3.1 seconds between incident/reply send starts |
@@ -197,11 +231,11 @@ Configuration is loaded at process startup; there is no hot reload.
 
 | Change | How to apply | State effect |
 | --- | --- | --- |
-| Baked TOML inventory | Edit the supported repository file, then run `up -d --build --wait` with the same Compose file/project selection | Rebuilds the image and reads its new inventory on startup |
+| Baked TOML configuration or endpoint inventory | Edit the supported repository file, then run `up -d --build --wait` with the same Compose file/project selection | Rebuilds the image and reads its configuration/inventory on startup |
 | `.env` token, chat, topic or container inventory selection | Run Compose `up -d --force-recreate --wait`; no image rebuild is needed if baked files are unchanged | Container receives the new environment; `restart` alone preserves its old environment |
 | Native TOML or exported environment | Stop and start the native process with the intended values | New startup reads the values |
 | Ordinary container restart | Reuses the existing image/environment and the same named state volume | Preserves incidents and delivery history; resets pending confirmations and freshness |
-| Site URL, marker, accepted status range, either confirmation count, body limit or either request timeout | Apply the inventory change as above | Resets that site's confirmed state to UNKNOWN, cancels obsolete never-attempted records and does not invent RECOVERY; attempted/in-flight outcomes remain protected |
+| Site URL, HTTP method, JSON body, marker, accepted status range, either confirmation count, body limit or either request timeout | Apply the inventory change as above | Resets that site's confirmed state to UNKNOWN, cancels obsolete never-attempted records and does not invent RECOVERY; attempted/in-flight outcomes remain protected |
 | Poll/reminder interval | Apply the inventory change | Preserves confirmed incident identity; restart begins fresh scheduling/reminder deadlines |
 | Site disabled/removed or alias renamed | Apply the inventory change | Removes the old active source state and obsolete never-attempted records; a new alias starts as a new source |
 | Telegram first enabled | Apply TOML and environment | Binds never-attempted logical-operator records to the configured destination without pretending they were already sent |
@@ -209,6 +243,8 @@ Configuration is loaded at process startup; there is no hot reload.
 | Telegram chat/topic changed | Apply environment | Old pending records fail with `destination_changed`; old incidents/history are not forwarded to the new destination |
 
 Removing a marker is a check-semantics change, so it resets the source rather than proving recovery of its previous incident. Successful sends and terminal failures are not reset merely by rebuilding or restarting. Keep the same project name and volume to retain state; `down` preserves the named volume, while `down --volumes` intentionally deletes it.
+
+Moving identical endpoint tables from inline configuration to `sites_file` preserves their existing GET incident identity. Changing the method or JSON body changes check semantics and resets only that endpoint. Reordering keys in the same JSON object does not change its canonical body or fingerprint.
 
 Validate locally before running:
 
