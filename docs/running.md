@@ -1,153 +1,280 @@
 # Running Sentinel Bot
 
-Sentinel runs configured website checks, confirms outages and recoveries, persists notifications in SQLite, and delivers them to one configured Telegram destination. Authorized Telegram commands and CLI status read cached observations. Incoming events, Linux metrics and production email delivery are not implemented. An explicit local SMTP test is a separate development utility.
+This guide covers the implemented application. For every supported TOML key, environment variable, default and validation limit, see the [configuration reference](configuration.md). The checked-in [website example](../config/sites.example.toml) and [Telegram example](../config/telegram.example.toml) contain optional settings as comments.
 
-Docker runs Python and the optional Mailpit development sink as separate services. Local checks need no Telegram token, paid email account or private infrastructure. The first image build needs network access to pinned public images and dependencies.
+## Contents
 
-## Local Docker setup
+- [Available features](#available-features)
+- [Choose a configuration](#choose-a-configuration)
+- [Local Docker and Mailpit](#local-docker-and-mailpit)
+- [Offline website demo](#offline-website-demo)
+- [Monitor public websites](#monitor-public-websites)
+- [Configure Telegram](#configure-telegram)
+- [Check content with marker](#check-content-with-marker)
+- [Verify a notification](#verify-a-notification)
+- [Read status, logs and incident history](#read-status-logs-and-incident-history)
+- [Apply changes and stop a stack](#apply-changes-and-stop-a-stack)
+- [Troubleshooting](#troubleshooting)
+- [Native development and checks](#native-development-and-checks)
 
-From the project root:
+## Available features
+
+| Capability | Current behavior |
+| --- | --- |
+| Website monitoring | Configured HTTP(S) GET requests, accepted status range, optional content marker, latency and normalized failure reasons |
+| Incident policy | UNKNOWN/UP/DOWN, consecutive failure/recovery confirmation, stable incident IDs and fresh-only reminders after accepted delivery |
+| Telegram | One fixed private chat, group/topic, or channel for alerts; cached authorized commands in private chats/groups |
+| Persistent delivery | SQLite outbox, bounded retries, shared send limits, provider rate pauses and restart continuity |
+| Operator tools | Local configuration validation, cached JSON status and worker health; commands do not trigger website probes |
+| Local email testing | Separate Mailpit container, browser inbox and an explicitly invoked synthetic SMTP message |
+| Docker | Non-root application, read-only root filesystem, dedicated state volume and isolated synthetic checks |
+
+Incoming HTTP events, Linux/Node Exporter metrics and production email alerts are not implemented. `/servers` and `/server <alias>` currently report that no server sources are configured. Mailpit's test message is a local utility; incidents are delivered through Telegram only.
+
+## Choose a configuration
+
+Run commands from the cloned repository root. Docker requires a running engine and the Compose plugin (`docker compose`). The first build needs access to pinned public images and dependencies; native development requires Linux/POSIX and Python 3.14.
+
+| File | Purpose | Network and delivery |
+| --- | --- | --- |
+| [`config/idle.toml`](../config/idle.toml) | Run process ownership, state and health without website checks | No website probes; Telegram disabled by default |
+| [`config/sites.example.toml`](../config/sites.example.toml) | Monitor operator-selected public websites | Outbound HTTP(S); Telegram disabled |
+| [`config/telegram.example.toml`](../config/telegram.example.toml) | Website monitoring and Telegram | Outbound HTTP(S), Telegram credentials required |
+| [`config/demo.toml`](../config/demo.toml) | Fast synthetic website checks | Named local fixture only; live Telegram prohibited |
+
+These four files are baked into the image. Edit a supported example and rebuild; creating another host TOML file does not automatically put it in the image. Native execution can select another file with `--config`. Only `[runtime]`, `[telegram]` and `[[sites]]` are supported; adding guessed `[email]` or `[[servers]]` tables fails validation.
+
+If `.env` does not exist, copy the template once:
 
 ```bash
-docker compose up -d --build --wait
-docker compose ps
-docker compose exec sentinel python -m sentinel_bot check-config
-docker compose exec sentinel python -m sentinel_bot healthcheck
-docker compose exec sentinel python -m sentinel_bot status
+cp .env.example .env
 ```
 
-The default configuration is explicit idle mode. Compose combines `compose.yaml` and `compose.override.yaml`: Python owns the state volume; Mailpit captures local SMTP. Containers are named `<project>-sentinel` and `<project>-mailpit`, without a replica suffix. Open [Mailpit](http://127.0.0.1:8025) to view its inbox. SMTP is available at `mailpit:1025` inside Compose and is not published on the host.
+Keep an existing `.env` and edit it instead of overwriting it. Compose loads it automatically; the native Python application does not. Exported shell variables can override Compose's `.env` values; see [Docker's interpolation rules](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/).
 
-Send one synthetic message deliberately:
+Use a consistent project name (`-p`) for every command targeting a stack. The examples use separate local, live and demo projects so their state and network settings stay independent. Copy commands only, without shell prompts, command output or JSON results.
+
+## Local Docker and Mailpit
+
+Start an idle stack with the local email sink. The explicit configuration selection keeps this setup idle even when `.env` selects live monitoring:
 
 ```bash
-docker compose exec sentinel python -m sentinel_bot test-email
+SENTINEL_CONTAINER_CONFIG=/app/config/idle.toml docker compose -p sentinel-local up -d --build --wait
+docker compose -p sentinel-local ps
+docker compose -p sentinel-local exec sentinel python -m sentinel_bot check-config
+docker compose -p sentinel-local exec sentinel python -m sentinel_bot healthcheck
+docker compose -p sentinel-local exec sentinel python -m sentinel_bot status
 ```
 
-It goes from `sentinel@example.test` to `operator@example.test`. Startup, checks, status and health never send mail. The test command requires the local test flag, allows only Mailpit or loopback and has fixed synthetic recipients. Success means local SMTP acceptance.
+Compose automatically combines `compose.yaml` with `compose.override.yaml`. Sentinel owns its state volume; Mailpit runs separately. Container names are `<project>-sentinel` and `<project>-mailpit`, without a replica suffix. See [Docker's Compose file selection rules](https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/).
 
-The application uses an internal network in the local override. Mailpit also has a bridge for its loopback UI, which gives the sink outbound connectivity. Relay and automatic version checks are disabled; accepted recipients are restricted to `example.test`. Mailpit retains at most 100 messages for 24 hours in a bounded temporary filesystem. Recreating its container clears the inbox.
-
-For another UI port:
+Open [Mailpit](http://127.0.0.1:8025). SMTP is `mailpit:1025` inside Compose and is not published to the host. To send one synthetic message deliberately:
 
 ```bash
-MAILPIT_HTTP_PORT=18025 docker compose up -d --wait
+docker compose -p sentinel-local exec sentinel python -m sentinel_bot test-email
 ```
 
-Open `http://127.0.0.1:18025`. You can also copy `.env.example` to `.env` and set `MAILPIT_HTTP_PORT`. `docker compose down` preserves the named state volume; `down --volumes` deletes that project's state and should be used only for an intentional reset.
+The fixed sender and recipient are `sentinel@example.test` and `operator@example.test`. SMTP acceptance is not a production inbox-delivery guarantee. Startup, status and health send no mail. Relay/version checks are disabled; accepted recipients are limited to `example.test`. Mailpit keeps at most 100 messages for 24 hours in temporary storage; recreating its container clears its inbox.
 
-## Synthetic website monitoring
+For a different UI port, set `MAILPIT_HTTP_PORT=18025` in `.env` and rerun the startup command. The application network in this local override is internal and cannot reach public websites or Telegram. Mailpit also has a separate bridge for its loopback UI.
 
-A separate override runs two local website fixtures without published ports, Mailpit or external requests:
+## Offline website demo
+
+Run two synthetic websites without credentials, Mailpit, published ports or external requests:
 
 ```bash
 docker compose -p sentinel-demo -f compose.yaml -f compose.monitoring.yaml up -d --build --wait
 docker compose -p sentinel-demo -f compose.yaml -f compose.monitoring.yaml exec sentinel python -m sentinel_bot status
 ```
 
-Both sources initially become UP without a recovery event. To simulate an outage:
+Both sources initially become UP without a recovery event. Simulate a primary outage:
 
 ```bash
 docker compose -p sentinel-demo -f compose.yaml -f compose.monitoring.yaml exec site-fixture python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/control/primary', data=b'down', timeout=2).close()"
 ```
 
-After three failures, `primary` becomes DOWN and one notification is pending. Repeat the command with `data=b'up'` to recover after two successes, or `data=b'slow'` to exercise timeouts while `secondary` continues polling. Read status again to see confirmed state, observation, freshness and queue count. Restarting Sentinel retains the active incident and does not create another logical DOWN. Restored readings remain stale until a new check completes.
+After three failed checks, `primary` becomes DOWN with a pending notification. Repeat with `data=b'up'` to recover after two successes, or `data=b'slow'` to exercise timeouts while `secondary` keeps polling. Restarting Sentinel preserves the incident ID; restored readings remain stale until checked again. This demo queues incidents without delivering alerts to Telegram.
 
-Stop this stack with the same Compose prefix followed by `down`. Its state is separate from the default local stack. This fixture covers website monitoring and queued incidents; it does not deliver alerts.
-
-## Configured websites and server Docker setup
-
-Use the base Compose file explicitly for outbound website monitoring. The automatic local override has an internal application network and cannot reach public websites.
-
-Edit `config/sites.example.toml` with your intended read-only public targets, then build and select that baked configuration:
+Stop the demo and preserve its state:
 
 ```bash
-SENTINEL_CONTAINER_CONFIG=/app/config/sites.example.toml docker compose -f compose.yaml up -d --build --wait
-docker compose -f compose.yaml exec sentinel python -m sentinel_bot status
-docker compose -f compose.yaml exec sentinel python -m sentinel_bot healthcheck
+docker compose -p sentinel-demo -f compose.yaml -f compose.monitoring.yaml down
 ```
 
-The example contains only a public placeholder. Configuration validation does not probe it; `run` probes enabled configured targets. Use the same `SENTINEL_CONTAINER_CONFIG` value for subsequent `up` commands, or set it in `.env`. For idle server execution, omit the variable. Use a different project name when running several stacks on one host.
+## Monitor public websites
 
-Configuration is baked into the image; rebuild after changing a supported config file. Only `idle.toml`, `sites.example.toml`, `demo.toml` and `telegram.example.toml` enter the image. State lives at `/var/lib/sentinel` on its own volume. UID/GID 10001, read-only rootfs, dropped capabilities and bounded resources/logs remain the defaults. There are no host filesystem mounts, Docker socket or application listener. Real-server deployment and live Telegram delivery need separate verification.
+Edit `config/sites.example.toml`: replace the public placeholder with a read-only page you intend to monitor. Add another `[[sites]]` table for each website, using a unique alias; at most 20 entries are supported. Full settings and ranges are in [website configuration](configuration.md#website-checks-sites).
 
-Only one process can own a state directory. Existing schema 1 or 2 upgrades atomically to schema 3; startup metadata and existing incident identities survive. SIGTERM cancels supervised workers and waits for network cleanup and started database operations before releasing ownership, including repeated cancellation. Health checks the current-run heartbeat and enabled website/Telegram workers. A DOWN website or an expected Telegram outage can coexist with a healthy bot. Docker does not restart a container solely because its health status is unhealthy.
+Set this line in `.env`:
 
-## Website configuration and incident behavior
+```dotenv
+SENTINEL_CONTAINER_CONFIG=/app/config/sites.example.toml
+```
 
-Native examples use `[runtime] mode = "monitor"` and one or more `[[sites]]` tables. `alias` and `url` are required. Optional settings and defaults:
-
-| Setting | Default |
-| --- | --- |
-| `marker` | No body read; optional exact UTF-8 text |
-| `status_min` / `status_max` | 200 / 399 |
-| `poll_interval_seconds` | 30 |
-| `connect_timeout_seconds` / `total_timeout_seconds` | 5 / 10 |
-| `failure_confirmation` / `recovery_confirmation` | 3 / 2 |
-| `reminder_interval_seconds` | 1800 after an accepted opening/reminder |
-| `max_body_bytes` | 65536, encoded and decoded |
-| `enabled` | true |
-| `runtime.max_concurrency` | 5 |
-
-Inventory is bounded to 20 unique aliases; disabled rows are still validated. Live URLs use HTTP(S), ports 80 or 443 and public addresses. Credentials, query strings, fragments and local/private addresses are rejected. Every connection validates all DNS answers; at most three same-origin redirects are allowed. TLS is verified, and ambient proxies/cookies are disabled. Demo mode allows only `http://site-fixture:8080`.
-
-The network deadline covers DNS, redirects and body reads. Shared-slot waiting is separately bounded to one request deadline. Local capacity exhaustion defers the check, clears pending confirmations and does not count as website failure. Each source polls sequentially and skips missed slots.
-
-The first success sets UP without RECOVERY. Confirmed DOWN starts at the first failure in its series; recovery uses the same incident identity. Opposite observations reset pending confirmations. Restart and stale gaps also reset pending series while preserving confirmed incidents. Freshness expires after `2 × poll interval + total request deadline`; missing or restored observations remain stale. Source progress health allows `2 × poll interval + 2 × total request deadline` for slot wait plus probing.
-
-Changing URL, marker, status range, confirmation counts, body limit or request timeouts resets only the affected source and cancels obsolete, never-attempted records without fabricated recovery. Already attempted records retain their identity and destination because external acceptance may be unknown. Poll/reminder interval changes preserve incidents.
-
-Snapshots, transitions and outbox records commit together. The queue coalesces obsolete, never-attempted outage/recovery pairs and reminders; attempted and in-flight records remain protected. Limits are 80 pending records, 20 in-flight records and bounded recent histories of 200 completed records and 200 incident audit records. Capacity failure rolls back the observation. No reminders accumulate without an accepted opening send. With Telegram disabled, incidents remain queued for the logical operator route; no sender or reminder backlog runs.
-
-## Telegram setup
-
-Telegram is opt-in. `config/telegram.example.toml` enables it with `[telegram] enabled = true` and contains a public placeholder website. Edit the website inventory before live execution. Credentials and private routing settings belong in environment variables, never TOML:
-
-| Variable | Required value |
-| --- | --- |
-| `SENTINEL_TELEGRAM_BOT_TOKEN` | Token from [BotFather](https://core.telegram.org/bots/tutorial#obtain-your-bot-token) |
-| `SENTINEL_TELEGRAM_CHAT_ID` | One numeric private-chat or group ID |
-| `SENTINEL_TELEGRAM_ALLOWED_USER_IDS` | Comma-separated unique numeric user IDs, at most 20 |
-| `SENTINEL_TELEGRAM_TOPIC_ID` | Optional positive group topic ID; leave empty for the whole chat |
-
-Use an operator-controlled chat. In a private chat, the user must first start the bot; in a group, add the bot and allow it to send messages. Group members can see its ordinary messages, even when they cannot issue commands. Retrieve IDs through your own trusted Telegram tooling; Sentinel does not discover destinations or expose an unauthenticated setup command. Run only one poller per bot token. An existing webhook, invalid token or competing poller produces a visible startup/runtime error; Sentinel never deletes a webhook automatically.
-
-For Docker, copy `.env.example` to the ignored `.env`, fill the Telegram variables and set `SENTINEL_CONTAINER_CONFIG=/app/config/telegram.example.toml`. Use the base Compose network, which permits outbound HTTPS:
+Build, validate locally, and start a dedicated outbound stack:
 
 ```bash
-docker compose -f compose.yaml build sentinel
-docker compose -f compose.yaml run --rm --no-deps sentinel check-config
-docker compose -f compose.yaml up -d --wait
-docker compose -f compose.yaml exec sentinel python -m sentinel_bot status
+docker compose -p sentinel-live -f compose.yaml build sentinel
+docker compose -p sentinel-live -f compose.yaml run --rm --no-deps sentinel check-config
+docker compose -p sentinel-live -f compose.yaml up -d --wait
+docker compose -p sentinel-live -f compose.yaml exec sentinel python -m sentinel_bot status
 ```
 
-`check-config` validates local configuration without contacting Telegram. `run` validates the bot identity and webhook state, starts long polling and delivers eligible queued incidents. There is no automatic startup/test message. The default local Mailpit override has an internal application network and cannot reach Telegram. The isolated website demo rejects live Telegram configuration. To use Telegram without website polling, enable it in `idle.toml` instead and select that file.
+Use `-f compose.yaml` explicitly. It excludes the automatic local override and permits outbound requests. Keep a different project name from an existing internal-network local stack; changing file selection does not safely migrate an already-created network.
 
-Native execution does not load `.env` automatically. Export the same Telegram variables into your shell, then run `.venv/bin/python -m sentinel_bot --config config/telegram.example.toml run`. The production API address is fixed to verified `https://api.telegram.org`; it cannot be overridden through inventory, environment or commands. API errors expose safe categories rather than request URLs, tokens or response bodies.
+Live targets must use HTTP(S), ports 80 or 443 and public addresses. URLs cannot include credentials, query strings or fragments. TLS and every DNS answer are checked. At most three same-origin redirects are followed; ambient proxies/cookies are disabled. `localhost`, private IPs and local Docker service names are rejected outside the restricted demo. There is no browser/JavaScript execution, SSH, service restart or arbitrary target discovery.
 
-### Commands and access
+A source never overlaps its own checks. Slow sources are independent; missed polling slots are skipped. Waiting for shared capacity is bounded and can defer a check without counting as website failure. Freshness and worker progress are separate from the confirmed incident state.
 
-`/help`, `/status`, `/sites`, `/servers` and `/server <alias>` read cached state without triggering probes. In a group, `/status@YourBotUsername` also works. Server commands currently report that no server sources are configured. Replies show their UTC snapshot time, confirmed state, latest observation and freshness; restored readings remain stale until checked again.
+## Configure Telegram
 
-Authorization requires the configured chat, an allowed human user and, when configured, the exact topic. Other chats/users/topics, anonymous senders, bots, channel posts and edited messages are ignored. Commands cannot change inventory, recipients or credentials, submit URLs, execute shell/SSH commands or manage services.
+### Select the bot and destination
 
-Commands allow six per minute per user with a burst of two, and 30 per minute overall with a burst of five. Replies are plain text, bounded to 3500 UTF-16 units. Their in-memory queue holds 20 replies, with at most three delivery attempts each; overflow or restart can lose a reply. Repeat the command if needed. This reply queue is separate from durable incident delivery.
+Create a bot through [BotFather](https://core.telegram.org/bots/tutorial#obtain-your-bot-token). Choose one destination:
 
-### Delivery and recovery
+| Destination | Setup | Commands |
+| --- | --- | --- |
+| Private chat | The allowed human user starts the bot first | Supported in this configured chat |
+| Group/supergroup | Add the bot and allow sending; optionally select one exact topic | Supported for allowed human users |
+| Broadcast channel | Add the bot as an administrator with permission to publish messages | Outgoing alerts only; channel posts are ignored |
 
-Incident sends and command replies share a FIFO sender with at least 3.1 seconds between request starts. Incidents have at most eight attempts, persisted before each request. Transient failures use exponential retry with bounded jitter, capped at five minutes unless Telegram requires a longer pause. HTTP 429 applies its `Retry-After` to all sends, including command replies. Supported pauses up to seven days are persisted and honored; a larger hint stops with an explicit configuration error instead of retrying early. The chosen spacing is conservative for one group; see [Telegram's rate guidance](https://core.telegram.org/bots/faq#my-bot-is-hitting-limits-how-do-i-avoid-this).
+An optional topic is for groups, not broadcast channels. With a channel selected, private messages to that bot do not bypass the configured-chat restriction. Group/channel members can see its ordinary alerts even when they cannot issue commands.
 
-The sender acknowledges delivery only after Telegram accepts the message. Accepted records are not resent on restart. If the process stops after external acceptance but before the SQLite acknowledgement, retry can duplicate that message; exactly-once external delivery is not guaranteed. Interrupted attempts keep their event ID and destination. Queued alerts include their incident time and may describe a historical state; commands show the current snapshot.
+Use the full signed numeric Bot API chat ID. A channel's positive internal ID is not its Bot API ID. For a private channel message link such as `https://t.me/c/1234567890/7`, convert the number after `/c/` using `-(1000000000000 + internal_id)`: the synthetic example becomes `-1001234567890`. The trailing `7` is the message ID. See [Telegram's message-link format](https://core.telegram.org/api/links#message-links) and [Bot API ID conversion](https://core.telegram.org/api/bots/ids#supergroupchannel-ids).
 
-DOWN precedes its matching RECOVERY. A permanent failure or exhausted opening attempt budget visibly blocks dependent recovery/reminders. A permanently failed reminder suppresses further reminders for that incident; recovery can still be delivered if its opening succeeded. Reminders require a fresh, active DOWN and an accepted opening/reminder. Current-process retry, cooldown and reminder deadlines use monotonic time. Restart conservatively repeats the saved retry/pause or full reminder interval, so clock changes cannot cause an early send but may add delay.
+For a public channel, `getChat` accepts `@channelusername` and returns `result.id`. For example, create a GET request in Postman to `https://api.telegram.org/bot{{bot_token}}/getChat`, define `bot_token` locally and set query parameter `chat_id` to the channel username. `getMe` verifies which bot owns a token. Use the returned numeric ID in Sentinel; keep actual tokens and private responses out of shared screenshots. See [getChat](https://core.telegram.org/bots/api#getchat).
 
-Enabling Telegram binds never-attempted logical-operator records to the configured destination. Disabling it pauses pending Telegram delivery. Changing chat/topic fails old pending records with `destination_changed`; it does not forward old history to the new destination. Recovery stays bound to the opening destination; if that route is no longer active after an accepted opening, recovery fails with `destination_changed`. Source changes and flapping do not discard attempted records whose external acceptance is uncertain.
+To obtain your own human user ID, do this **before starting Sentinel's poller**, with no other poller or webhook using that token. Send `/start` to your bot in a private chat. In Postman, GET `https://api.telegram.org/bot{{bot_token}}/getUpdates` with query parameters `timeout=0` and `allowed_updates=["message"]`. Find your message in `result` and use its `message.from.id` for the allowlist. Its `message.chat.id` selects that private chat if you want private-chat delivery instead of a group/channel. Do not confuse a group/channel ID with a human user's ID. This is Telegram's [getUpdates method](https://core.telegram.org/bots/api#getupdates), not a Sentinel command.
 
-CLI status includes Telegram `enabled`, `pending`, `retrying`, `failed`, `blocked`, `accepted`, `in_flight`, `paused` and a normalized `last_error`. Counts describe bounded retained records, not an all-time archive. API outages and rate pauses do not stop website checks. Invalid credentials, webhook conflicts and unexpected worker errors stop visibly. The polling checkpoint is durable but expires after 24 hours to handle Telegram's bounded update retention and changing IDs after a quiet period; command replies are still best-effort. See the [Bot API update contract](https://core.telegram.org/bots/api#getting-updates).
+### Enable Telegram and start
+
+Edit `config/telegram.example.toml` with your monitored websites. In `.env`, select that config and fill the four channel variables:
+
+```dotenv
+SENTINEL_CONTAINER_CONFIG=/app/config/telegram.example.toml
+SENTINEL_TELEGRAM_BOT_TOKEN=REPLACE_WITH_BOTFATHER_TOKEN
+SENTINEL_TELEGRAM_CHAT_ID=-1001234567890
+SENTINEL_TELEGRAM_ALLOWED_USER_IDS=123456789
+SENTINEL_TELEGRAM_TOPIC_ID=
+```
+
+The token and IDs above are placeholders, not working credentials. The human-user allowlist is required even for a channel-only destination; it contains user IDs, not the channel ID. Leave topic empty unless using a group topic. Adding credentials alone does not enable Telegram: the selected TOML must contain `[telegram] enabled = true`. See [Telegram settings and ID constraints](configuration.md#telegram).
+
+Run the same four `sentinel-live` commands from [website startup](#monitor-public-websites). They select the Telegram example through `.env`. If you also run another stack, only one poller may use the same token. To run Telegram without website checks, enable `[telegram]` in `idle.toml` and select that file.
+
+`check-config` only validates local settings. `run` calls `getMe`/`getWebhookInfo`, starts long polling and delivers eligible queued incidents. It sends no automatic startup/test message. Wrong credentials, an existing webhook or competing poller stop visibly; Sentinel never removes a webhook automatically. Production requests use verified `https://api.telegram.org`; operator settings cannot redirect that API boundary.
+
+### Commands
+
+| Command | Cached response |
+| --- | --- |
+| `/help` | Supported commands |
+| `/status` | Source state, freshness and Telegram delivery counters |
+| `/sites` | Website observations and confirmed incidents |
+| `/servers` | Currently reports no configured server sources |
+| `/server <alias>` | Currently reports no configured server sources; never probes a submitted address |
+
+In a group, use `/status@YourBotUsername` to address the intended bot. Chat, optional topic and allowed-human checks happen before cache access; other users/chats, bots, anonymous senders, channel posts and edited messages are ignored. Authorization cannot change routing or configuration.
+
+Replies are plain text with UTC snapshot time, bounded to 3500 UTF-16 units. Limits are six commands/minute per user (burst two), 30/minute overall (burst five), a 20-reply in-memory queue and up to three attempts. Overflow/restart may lose a reply; repeat the command if needed. Command replies have a different persistence contract from incident delivery.
+
+## Check content with marker
+
+Without `marker`, a website check inspects the HTTP status and closes the response without reading its body. To require content as well, uncomment the example inside that site's `[[sites]]` table:
+
+```toml
+marker = "Example Domain"
+```
+
+The configured status range must match and the response must contain this exact, case-sensitive UTF-8 substring. This can detect an error or maintenance page returning HTTP 200. It is a text search in the HTTP response, not a CSS selector, regular expression or search in a JavaScript-rendered page. Choose a stable fragment from your intended response.
+
+Disable the content check by removing/commenting the field. **`marker = ""` is invalid.** A marker is at most 4096 UTF-8 bytes and cannot exceed `max_body_bytes`; encoded and decoded response bodies are each bounded to that body's configured limit, at most 65536 bytes. A missing marker or body-limit violation is a failed observation.
+
+Changing marker, URL, accepted statuses, confirmation counts, body limit or request timeouts resets that source's confirmed state without inventing RECOVERY. Poll/reminder interval changes retain the incident. Configuration changes require a rebuild in Docker; they are not a way to simulate recovery of an existing incident.
+
+## Verify a notification
+
+For a private/group destination, send `/status` from an allowed user in the configured chat/topic after startup. For a broadcast channel, test an outgoing incident instead of a command.
+
+For a deliberate DOWN test, temporarily replace the existing site's marker with an absent string in `config/telegram.example.toml`, or add the field if it is absent. Keep only one active `marker` key inside that site's `[[sites]]` table:
+
+```toml
+marker = "SENTINEL_MANUAL_TEST_MISSING_MARKER"
+```
+
+Rebuild and recreate the live service:
+
+```bash
+docker compose -p sentinel-live -f compose.yaml build sentinel
+docker compose -p sentinel-live -f compose.yaml up -d --wait --force-recreate sentinel
+```
+
+With the example's 30-second interval and three-failure confirmation, expect DOWN roughly one minute after a fresh start; allow 1–2 minutes for checks and API requests. Read CLI status: state becomes DOWN, then `telegram.accepted` increases after provider acceptance. The message identifies the source and incident with UTC event/start times. Startup alone and the first successful check produce no alert.
+
+Afterwards remove the temporary marker, rebuild and recreate again. This resets the source and does not produce RECOVERY for that test incident. To verify a matching RECOVERY, restore the same monitored endpoint while keeping its inventory/rules unchanged; two successful observations then resolve the same incident. No test command deletes state or creates a fake recovery.
+
+A permanent failure (for example an invalid destination) is retained rather than retried forever. After fixing it, the terminal record does not resend on restart. A new unique temporary marker produces a new test incident; it does not repair or reroute the old record. Do not clear the database to repeat a test.
+
+## Read status, logs and incident history
+
+```bash
+docker compose -p sentinel-live -f compose.yaml exec sentinel python -m sentinel_bot status
+docker compose -p sentinel-live -f compose.yaml exec sentinel python -m sentinel_bot healthcheck
+docker compose -p sentinel-live -f compose.yaml logs --tail=80 sentinel
+```
+
+`status` reads cached SQLite/health data without probing targets or contacting Telegram. `healthcheck` checks process ownership, current-run heartbeat and worker progress. A website DOWN or a handled provider outage can coexist with a healthy bot. Healthy does not mean a notification arrived; Docker does not restart a container solely because health becomes unhealthy.
+
+The first success establishes UP without RECOVERY. A DOWN begins at the first failure of its confirmation series, and RECOVERY reuses that incident ID. Opposite observations, startup and stale gaps reset pending series. Restored readings remain stale until checked again; freshness expires after `2 × poll interval + total request deadline`. Unknown/missing readings are not silently healthy.
+
+Telegram status reports `enabled`, `pending`, `retrying`, `failed`, `blocked`, `accepted`, `in_flight`, `paused` and a safe `last_error`. The counters describe bounded retained records. `last_error` may retain an older failed delivery even after a newer notification succeeds: `accepted: 1`, `failed: 1`, `pending: 0` is a valid outcome.
+
+Routine probes and successful sends do not write INFO logs. Normalized warnings go to container stdout; durable incident/delivery evidence is in `/var/lib/sentinel/state.sqlite3` on `<project>_sentinel-state`. It retains the latest source observation, incident audit, notification IDs, attempt counts/times, provider-acceptance time and terminal errors. It does not retain every probe or a separate Telegram `message_id`. Default bounds are 80 pending, 20 in flight, 200 terminal delivery records and 200 incident audit records.
+
+DOWN precedes its RECOVERY. A failed opening blocks dependent recovery/reminders; a permanently failed reminder suppresses further reminders for that incident. Reminders require fresh active DOWN and an accepted opening/reminder. All sends share a FIFO with at least 3.1 seconds between starts; incidents have at most eight attempts. Backoff/jitter is capped at 300 seconds unless Telegram asks for more. Shared Retry-After pauses up to seven days survive restart; a larger hint stops explicitly. Current-process deadlines are monotonic; restart conservatively repeats saved delays/full reminder intervals and can add delay.
+
+Provider acceptance is not proof a human read the message. A crash between external acceptance and local acknowledgement can duplicate a send. Accepted records are not deliberately resent. Interrupted attempts retain identity/destination; source changes/flapping coalesce only never-attempted obsolete records. Disabling Telegram pauses delivery. Changing chat/topic does not forward private old incidents: old pending records fail, and recovery stays bound to its opening route.
+
+## Apply changes and stop a stack
+
+| Change | Apply it |
+| --- | --- |
+| A baked TOML example or application code | `build sentinel`, then `up -d --wait --force-recreate sentinel` using the same project/files |
+| `.env` credentials, destination, topic or selected config | `up -d --wait --force-recreate sentinel`; rebuild too if the TOML changed |
+| Native TOML or exported environment | Stop the process and start it again with the same state path |
+
+`docker compose restart` keeps the container's existing environment and image. There is no hot reload. `SENTINEL_CONTAINER_CONFIG` selects an already-baked path; the native `SENTINEL_CONFIG` variable has a separate scope.
+
+Stop and remove only the live stack's container/network, retaining its database:
+
+```bash
+docker compose -p sentinel-live -f compose.yaml down
+```
+
+Use the matching project/files for the local or demo stack. `down --volumes` deletes the named state and should be reserved for an intentional reset. Each state directory has one owner; SIGTERM cancels supervised workers and waits for started state operations/network cleanup before releasing the stable-inode lock. Never delete the lock file to bypass ownership.
+
+The default image runs UID/GID 10001, drops capabilities and uses a read-only root filesystem, bounded resources/logs and its own state volume. It exposes no application listener and uses no host mounts, Docker socket or privileged mode.
+
+## Troubleshooting
+
+| Symptom | Check |
+| --- | --- |
+| Telegram `enabled: false` | Selected config and `[telegram] enabled`; populated `.env` alone is insufficient |
+| UNKNOWN, no pending alert | Wait for consecutive confirmation checks; inspect observation, freshness and local capacity deferral |
+| HTTP 200 but error `marker` | Marker spelling/case, actual response body, maintenance/JavaScript page and body limit |
+| Healthy but no message | Check configured source state and `accepted`/`pending`/`failed`; startup and initial UP do not send alerts |
+| `bad_request` / `chat not found` | Full signed numeric Bot API destination, bot access to that chat/channel and an empty topic for broadcast channels; verify with `getChat` |
+| `forbidden` | Bot membership and sending/posting permissions; confirm the token belongs to the bot you added |
+| Fixed a permanent error but no retry | The prior record is terminal; wait for a new real incident or deliberately create a new test incident |
+| `accepted` increased but `last_error` remains | A previous retained delivery failed; inspect counts/history rather than interpreting it as the new send's outcome |
+| Token/webhook/conflicting poller error | Verify bot identity, run one poller per token and manage any existing webhook explicitly |
+| API/network failures with local override | Use a dedicated outbound project and only `-f compose.yaml`; the Mailpit and synthetic-demo application networks are internal |
+| `.env` edit has no effect | Recreate the container; check exported shell variables overriding `.env` without sharing expanded secrets |
+| Status reports missing state | Start that same config/project/state first; status does not create a database |
 
 ## Native development and checks
 
-Native execution requires Linux/POSIX, Python 3.14 and usable `venv`/`pip`. Docker provides the Linux runtime on other Docker-capable hosts. HTTP uses aiohttp and cancellable aiodns; runtime, build and development dependencies are pinned and hash-locked.
+Docker supplies the supported Linux runtime on other Docker-capable hosts. Runtime/build/development dependencies are pinned and hash-locked; the HTTP boundary uses aiohttp and cancellable aiodns.
 
 ```bash
 python3.14 -m venv .venv
@@ -155,10 +282,19 @@ python3.14 -m venv .venv
 .venv/bin/python -m pip install --no-deps --no-build-isolation -e .
 .venv/bin/python -m sentinel_bot check-config
 .venv/bin/python -m sentinel_bot --config config/sites.example.toml check-config
-.venv/bin/python -m sentinel_bot --config config/sites.example.toml run
 ```
 
-The default native file is `config/idle.toml`, with state under `data/`. `SENTINEL_CONFIG` or `--config` selects another file; `SENTINEL_STATE_DIR` overrides state. `SENTINEL_CONTAINER_CONFIG` is a separate Compose setting so native paths cannot replace container paths. In another terminal, use the same config and state directory with `status` or `healthcheck`. Status reads existing state and never creates a database or starts a request; before the first run it reports a missing-state error.
+Default native config is `config/idle.toml`, state `data/`. Start monitoring deliberately with `.venv/bin/python -m sentinel_bot --config config/sites.example.toml run`. Export Telegram variables first if selecting the Telegram example; native Python does not read Compose's `.env`. Use the same `--config` and `SENTINEL_STATE_DIR` in another terminal for status/health. See [CLI and environment precedence](configuration.md#configuration-loading).
+
+| CLI command | Effect |
+| --- | --- |
+| `check-config` | Validate locally without requests or state initialization |
+| `run` | Own state, supervise enabled monitors/Telegram workers and handle shutdown |
+| `status` | Print cached JSON state and delivery counters |
+| `healthcheck` | Check local runtime/worker progress, with no provider request |
+| `test-email` | Send one fixed synthetic message only with local SMTP opt-in |
+
+Run development checks without real provider credentials:
 
 ```bash
 .venv/bin/ruff format --check .
@@ -170,4 +306,4 @@ python3 scripts/monitoring_smoke.py
 python3 scripts/telegram_smoke.py
 ```
 
-Tests use local HTTP/SMTP fixtures and temporary SQLite, never real monitored targets or providers. Foundation smoke checks disposable local/server stacks, actual container restrictions, restart, ownership, health, SIGTERM and one explicit Mailpit message. Monitoring smoke verifies independent sources, outage/recovery, atomic queue, stale restart and incident identity. Telegram smoke runs the real application and HTTP adapter against loopback fixtures inside an isolated container: access checks, cached commands, 429/retry, ordered outage/recovery and restart continuity. It needs no bot token and sends no real Telegram messages. Each script creates unique temporary projects, clears inherited Telegram credentials, and removes only its own containers/volumes. CI runs the same checks; local success does not establish a successful GitHub Actions run or real deployment.
+Tests use loopback HTTP/SMTP, fake Telegram and temporary SQLite. Foundation smoke checks separate local/server stacks, Mailpit, ownership/health/state/SIGTERM and container restrictions. Website smoke checks independent sources, outage/recovery and restart. Telegram smoke runs the real application/HTTP boundary against isolated local fixtures, including access checks, 429/retry and restart acceptance. Scripts clear inherited Telegram credentials, use unique temporary projects and remove only their own containers/volumes. They do not contact real Telegram or monitored public websites. Local passes do not establish a GitHub Actions run or deployment.

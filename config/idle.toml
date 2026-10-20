@@ -1,6 +1,15 @@
+# No website probes. Use this for the local Mailpit check or Telegram commands only.
+# Configuration reference: ../docs/configuration.md
 [runtime]
 mode = "idle"
+# Native state path; Compose overrides this with its persistent volume path.
 state_dir = "data"
+# Local health heartbeat; its timeout must cover at least two heartbeat intervals.
 heartbeat_interval_seconds = 1.0
 health_timeout_seconds = 5.0
+# Time allowed for worker cancellation and cleanup.
 shutdown_timeout_seconds = 5.0
+
+# Telegram is disabled unless explicitly enabled; credentials belong in the environment.
+# [telegram]
+# enabled = true
