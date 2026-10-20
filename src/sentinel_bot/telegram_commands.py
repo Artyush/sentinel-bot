@@ -281,4 +281,18 @@ def render_command(command: Command, snapshot: Mapping[str, object], *, now: dat
         lines.extend(_site_line(site, now.astimezone(UTC)) for site in rows)
     else:
         lines.append("No website sources configured.")
+    if command.name == "status":
+        sources = snapshot.get("sources")
+        if isinstance(sources, (list, tuple)):
+            for value in sources[:MAX_SITES]:
+                source = _mapping(value)
+                alias = source.get("alias")
+                if not isinstance(alias, str) or _ALIAS.fullmatch(alias) is None:
+                    continue
+                lines.append(
+                    f"Push {alias}: availability=UNKNOWN; "
+                    f"active={_count(source.get('active_incidents'))}; "
+                    f"received age={_age(source.get('last_received_at'), now)}; "
+                    f"event age={_age(source.get('last_event_at'), now)}"
+                )
     return bound_text("\n".join(lines))

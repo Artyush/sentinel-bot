@@ -11,6 +11,7 @@ This guide covers the implemented application. For every supported TOML key, env
 - [Monitor public websites](#monitor-public-websites)
 - [Configure endpoint inventory](#configure-endpoint-inventory)
 - [Configure Telegram](#configure-telegram)
+- [Receive events from servers](#receive-events-from-servers)
 - [Check content with marker](#check-content-with-marker)
 - [Verify a notification](#verify-a-notification)
 - [Read status, logs and incident history](#read-status-logs-and-incident-history)
@@ -26,11 +27,12 @@ This guide covers the implemented application. For every supported TOML key, env
 | Incident policy | UNKNOWN/UP/DOWN, consecutive failure/recovery confirmation, stable incident IDs and fresh-only reminders after accepted delivery |
 | Telegram | One fixed private chat, group/topic, or channel for alerts; cached authorized commands in private chats/groups |
 | Persistent delivery | SQLite outbox, bounded retries, shared send limits, provider rate pauses and restart continuity |
+| Incoming events | Source-authenticated POST, durable receipts, duplicate suppression and occurrence-based firing/resolution |
 | Operator tools | Local configuration validation, cached JSON status and worker health; commands do not trigger website probes |
 | Local email testing | Separate Mailpit container, browser inbox and an explicitly invoked synthetic SMTP message |
 | Docker | Non-root application, read-only root filesystem, dedicated state volume and isolated synthetic checks |
 
-Incoming HTTP events, Linux/Node Exporter metrics and production email alerts are not implemented. `/servers` and `/server <alias>` currently report that no server sources are configured. Mailpit's test message is a local utility; incidents are delivered through Telegram only.
+Linux/Node Exporter metrics and production email alerts are not implemented. `/servers` and `/server <alias>` currently report that no server metrics sources are configured. Mailpit's test message is a local utility; incidents are delivered through Telegram only. The [incoming events API](api.md) documents requests, authentication, responses and sender retry rules.
 
 ## Choose a configuration
 
@@ -42,9 +44,10 @@ Run commands from the cloned repository root. Docker requires a running engine a
 | [`config/sites.example.toml`](../config/sites.example.toml) | Monitor operator-selected public websites | Outbound HTTP(S); Telegram disabled |
 | [`config/telegram.example.toml`](../config/telegram.example.toml) | Website monitoring and Telegram | Outbound HTTP(S), Telegram credentials required |
 | [`config/demo.toml`](../config/demo.toml) | Fast synthetic website checks | Named local fixture only; live Telegram prohibited |
+| [`config/ingress.example.toml`](../config/ingress.example.toml) | Push-only source and Telegram delivery | Optional private listener; HTTPS proxy provisioned separately |
 | [`config/checks.example.toml`](../config/checks.example.toml) | Shared endpoint inventory for website/Telegram configurations | Endpoint tables only; do not select it as the main configuration |
 
-The four main configurations and shared endpoint inventory are baked into the image. Edit a supported file and rebuild; creating another host TOML file does not automatically put it in the image. Native execution can select another main file with `--config`. Main files support `[runtime]`, `[telegram]` and inline `[[sites]]`, or `runtime.sites_file` instead of inline sites. The separate endpoint file supports only `[[sites]]`; adding guessed `[email]` or `[[servers]]` tables fails validation.
+The five main configurations and shared endpoint inventory are baked into the image. Edit a supported file and rebuild; creating another host TOML file does not automatically put it in the image. Native execution can select another main file with `--config`. Main files support `[runtime]`, `[telegram]`, optional `[ingress]`/`[[sources]]` and inline `[[sites]]`, or `runtime.sites_file` instead of inline sites. The separate endpoint file supports only `[[sites]]`; adding guessed `[email]` or `[[servers]]` tables fails validation.
 
 If `.env` does not exist, copy the template once:
 
@@ -217,6 +220,40 @@ In a group, use `/status@YourBotUsername` to address the intended bot. Chat, opt
 
 Replies are plain text with UTC snapshot time, bounded to 3500 UTF-16 units. Limits are six commands/minute per user (burst two), 30/minute overall (burst five), a 20-reply in-memory queue and up to three attempts. Overflow/restart may lose a reply; repeat the command if needed. Command replies have a different persistence contract from incident delivery.
 
+## Receive events from servers
+
+The [API guide](api.md) and [OpenAPI file](openapi.yaml) describe the single `POST /api/v1/events` route. Configure the source in [`config/ingress.example.toml`](../config/ingress.example.toml); the example accepts `service.health` and `security.attack` from the push-only alias `app`. Set the Telegram credentials from the previous section and a distinct `SENTINEL_SOURCE_APP_TOKEN` in the ignored `.env`. Generate a token locally:
+
+```bash
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+```
+
+Start a separate outbound stack with the explicit ingress override:
+
+```bash
+docker compose -p sentinel-ingress -f compose.yaml -f compose.ingress.yaml build sentinel
+docker compose -p sentinel-ingress -f compose.yaml -f compose.ingress.yaml run --rm --no-deps sentinel check-config
+docker compose -p sentinel-ingress -f compose.yaml -f compose.ingress.yaml up -d --wait
+docker compose -p sentinel-ingress -f compose.yaml -f compose.ingress.yaml exec sentinel python -m sentinel_bot status
+```
+
+Only one running stack may poll the same Telegram bot token. Use the same project/file selection to stop an earlier live stack before moving that token here; its state volume remains separate. The ordinary local override is excluded because its network blocks outgoing Telegram requests.
+
+The override exposes container port 8080 to its network, with **no published host port**. Put an operator-managed HTTPS reverse proxy on that network and route only `/api/v1/events` to `sentinel:8080`. The proxy must enforce TLS, connection/header limits and a request-body limit no greater than the application's configured bound. It must preserve the source's Authorization header. The application does not trust forwarded headers as source identity. This repository does not provision a public hostname or TLS certificate.
+
+For native local testing, change `[ingress] host` to `"127.0.0.1"`, export Telegram variables and the source token, then run:
+
+```bash
+.venv/bin/python -m sentinel_bot --config config/ingress.example.toml check-config
+.venv/bin/python -m sentinel_bot --config config/ingress.example.toml run
+```
+
+Use `http://127.0.0.1:8080/api/v1/events` only for local loopback requests; remote senders use HTTPS. Import `docs/openapi.yaml` into Postman, set the actual base URL/source token locally and generate a fresh UUID/UTC timestamp for each new event. Preserve the same request on retry. Importing documentation does not enable a listener or send a message.
+
+An enabled receiver currently requires Telegram and at least one enabled source. Each source's `token_env` names its environment credential. If adding another source in Docker, explicitly forward its token variable in your Compose override as the example does for `SENTINEL_SOURCE_APP_TOKEN`; merely adding a host `.env` key does not pass it into the container. Configuration changes require rebuild/recreation. To rotate a token, replace its environment value and recreate the container; the old token then stops authenticating.
+
+`mode = "push"` defines no target and creates no probe worker. To combine polling and incoming reports, keep an explicit `[[sites]]` entry and use `mode = "hybrid"` in `[[sources]]` with the same alias; their state remains separate. The cached `sources` view and Telegram `/status` show last received/event times and active occurrence counts, with availability UNKNOWN. Removing a source or changing website settings does not discard its already accepted push deliveries.
+
 ## Check content with marker
 
 Without `marker`, a website check inspects the HTTP status and closes the response without reading its body. To require content as well, uncomment the example inside that endpoint's `[[sites]]` table in `config/checks.example.toml`:
@@ -268,7 +305,7 @@ The first success establishes UP without RECOVERY. A DOWN begins at the first fa
 
 Telegram status reports `enabled`, `pending`, `retrying`, `failed`, `blocked`, `accepted`, `in_flight`, `paused` and a safe `last_error`. The counters describe bounded retained records. `last_error` may retain an older failed delivery even after a newer notification succeeds: `accepted: 1`, `failed: 1`, `pending: 0` is a valid outcome.
 
-Routine probes and successful sends do not write INFO logs. Normalized warnings go to container stdout; durable incident/delivery evidence is in `/var/lib/sentinel/state.sqlite3` on `<project>_sentinel-state`. It retains the latest source observation, incident audit, notification IDs, attempt counts/times, provider-acceptance time and terminal errors. It does not retain every probe or a separate Telegram `message_id`. Default bounds are 80 pending, 20 in flight, 200 terminal delivery records and 200 incident audit records.
+Routine probes and successful sends do not write INFO logs. Normalized warnings go to container stdout; durable incident/delivery evidence is in `/var/lib/sentinel/state.sqlite3` on `<project>_sentinel-state`. It retains the latest source observation, incident audit, notification IDs, attempt counts/times, provider-acceptance time and terminal errors. It does not retain every probe or a separate Telegram `message_id`. Website pending records are bounded to 80; incoming events have a separate 1,000-record budget with lifecycle reservations, for a combined maximum of 1,080. In-flight records remain bounded to 20, terminal delivery history and website incident audit to 200 each. Event receipts and terminal occurrence records have separate retention budgets.
 
 DOWN precedes its RECOVERY. A failed opening blocks dependent recovery/reminders; a permanently failed reminder suppresses further reminders for that incident. Reminders require fresh active DOWN and an accepted opening/reminder. All sends share a FIFO with at least 3.1 seconds between starts; incidents have at most eight attempts. Backoff/jitter is capped at 300 seconds unless Telegram asks for more. Shared Retry-After pauses up to seven days survive restart; a larger hint stops explicitly. Current-process deadlines are monotonic; restart conservatively repeats saved delays/full reminder intervals and can add delay.
 
@@ -292,7 +329,7 @@ docker compose -p sentinel-live -f compose.yaml down
 
 Use the matching project/files for the local or demo stack. `down --volumes` deletes the named state and should be reserved for an intentional reset. Each state directory has one owner; SIGTERM cancels supervised workers and waits for started state operations/network cleanup before releasing the stable-inode lock. Never delete the lock file to bypass ownership.
 
-The default image runs UID/GID 10001, drops capabilities and uses a read-only root filesystem, bounded resources/logs and its own state volume. It exposes no application listener and uses no host mounts, Docker socket or privileged mode.
+The default image runs UID/GID 10001, drops capabilities and uses a read-only root filesystem, bounded resources/logs and its own state volume. Poll-only operation has no listener; ingress is enabled explicitly and remains private to its network. The application uses no host mounts, Docker socket or privileged mode.
 
 ## Troubleshooting
 
@@ -343,6 +380,7 @@ Run development checks without real provider credentials:
 python3 scripts/docker_smoke.py
 python3 scripts/monitoring_smoke.py
 python3 scripts/telegram_smoke.py
+python3 scripts/ingress_smoke.py
 ```
 
-Tests use loopback HTTP/SMTP, fake Telegram and temporary SQLite. Foundation smoke checks separate local/server stacks, Mailpit, ownership/health/state/SIGTERM and container restrictions. Website smoke checks independent sources, outage/recovery and restart. Telegram smoke runs the real application/HTTP boundary against isolated local fixtures, including access checks, 429/retry and restart acceptance. Scripts clear inherited Telegram credentials, use unique temporary projects and remove only their own containers/volumes. They do not contact real Telegram or monitored public websites. Local passes do not establish a GitHub Actions run or deployment.
+Tests use loopback HTTP/SMTP, fake Telegram and temporary SQLite. Foundation smoke checks separate local/server stacks, Mailpit, ownership/health/state/SIGTERM and container restrictions. Website smoke checks independent sources, outage/recovery and restart. Telegram smoke runs the real application/HTTP boundary against isolated local fixtures, including access checks, 429/retry and restart acceptance. Ingress smoke checks authenticated acceptance, duplicate/conflict behavior, terminal occurrences, ordered Telegram delivery/retry, push-only isolation and restart. Scripts clear inherited Telegram credentials, use unique temporary projects and remove only their own containers/volumes. They do not contact real Telegram or monitored public websites. Local passes do not establish a GitHub Actions run or deployment.

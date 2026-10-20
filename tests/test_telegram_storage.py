@@ -8,7 +8,14 @@ import pytest
 
 from sentinel_bot.config import SiteConfig
 from sentinel_bot.models import CheckResult, ErrorKind, EventKind, Observation, SiteState
-from sentinel_bot.storage import DATABASE_NAME, SQLiteStore, StorageError, initialize_state
+from sentinel_bot.storage import (
+    DATABASE_NAME,
+    MAX_PENDING_NOTIFICATIONS,
+    MAX_PENDING_PUSH_NOTIFICATIONS,
+    SQLiteStore,
+    StorageError,
+    initialize_state,
+)
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
 DESTINATION = "telegram:-100123456:0"
@@ -92,7 +99,7 @@ def test_schema_two_upgrade_preserves_pending_accepted_events_and_startups(tmp_p
                 (identity, event, delivered),
             )
     startup = initialize_state(tmp_path, NOW + timedelta(days=1))
-    assert startup.schema_version == 3 and startup.startup_count == 8
+    assert startup.schema_version == 4 and startup.startup_count == 8
     assert startup.first_started_at == NOW.isoformat()
     store = SQLiteStore(tmp_path)
     before = store.pending_notifications()[0]
@@ -766,5 +773,11 @@ def test_reservation_capacity_and_unknown_candidates_do_not_mutate_state(
     before = store.pending_notifications()
     assert store.reserve_due_delivery(NOW, ready_ids=("unknown",)) is None
     with pytest.raises(ValueError, match="Too many"):
-        store.reserve_due_delivery(NOW, ready_ids=tuple(str(index) for index in range(81)))
+        store.reserve_due_delivery(
+            NOW,
+            ready_ids=tuple(
+                str(index)
+                for index in range(MAX_PENDING_NOTIFICATIONS + MAX_PENDING_PUSH_NOTIFICATIONS + 1)
+            ),
+        )
     assert store.pending_notifications() == before

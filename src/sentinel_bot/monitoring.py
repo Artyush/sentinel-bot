@@ -21,6 +21,7 @@ class MonitoringProgress:
     workers: dict[str, float] = field(default_factory=dict)
     observations: dict[str, float] = field(default_factory=dict)
     telegram: dict[str, float] = field(default_factory=dict)
+    ingress: float | None = None
 
 
 async def _site_loop(

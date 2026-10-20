@@ -293,6 +293,17 @@ async def _poll(
 
 def _notification(record: OutboxRecord) -> str:
     event = record.event
+    if event.kind in {EventKind.NOTIFICATION, EventKind.FIRING, EventKind.RESOLVED}:
+        assert event.received_at is not None
+        return bound_text(
+            f"{event.kind.value}: {record.source_alias}\n"
+            f"Type: {event.event_type}; severity: {event.severity}\n"
+            f"{event.summary}\n"
+            f"Occurrence: {event.incident_id}\n"
+            f"Event time (UTC): {event.occurred_at.astimezone(UTC).isoformat()}\n"
+            f"Received time (UTC): {event.received_at.astimezone(UTC).isoformat()}\n"
+            "Source-reported event; current status may have changed."
+        )
     return bound_text(
         f"{event.kind.value}: {record.source_alias}\n"
         f"Incident: {event.incident_id}\n"

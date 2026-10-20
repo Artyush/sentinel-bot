@@ -58,12 +58,12 @@ def test_schema_one_upgrade_preserves_startup_metadata(tmp_path: Path) -> None:
         )
     started = NOW + timedelta(days=1)
     metadata = initialize_state(tmp_path, started)
-    assert metadata.schema_version == 3
+    assert metadata.schema_version == 4
     assert metadata.first_started_at == NOW.isoformat()
     assert metadata.last_started_at == started.isoformat()
     assert metadata.startup_count == 8
     with closing(sqlite3.connect(tmp_path / DATABASE_NAME)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
         assert connection.execute("SELECT COUNT(*) FROM sites").fetchone() == (0,)
         assert connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone() == (0,)
 

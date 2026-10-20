@@ -1,0 +1,26 @@
+# Push-only events and Telegram delivery. See ../docs/api.md and ../docs/running.md.
+[runtime]
+mode = "monitor"
+state_dir = "data"
+
+[telegram]
+enabled = true
+
+[ingress]
+enabled = true
+# Internal container listener; expose it only through your HTTPS reverse proxy.
+# For native local development, use 127.0.0.1 instead.
+host = "0.0.0.0"
+port = 8080
+max_body_bytes = 16384
+max_summary_chars = 1000
+body_timeout_seconds = 5
+max_concurrency = 10
+
+[[sources]]
+alias = "app"
+mode = "push"
+allowed_types = ["service.health", "security.attack"]
+# Keep a distinct random token for each source, outside TOML and Git.
+token_env = "SENTINEL_SOURCE_APP_TOKEN"
+enabled = true
