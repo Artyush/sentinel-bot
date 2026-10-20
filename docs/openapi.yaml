@@ -1,0 +1,268 @@
+openapi: 3.1.1
+info:
+  title: Sentinel Bot incoming events
+  version: 1.0.0
+  description: >-
+    Submit technical events from configured sources. Acceptance means durable SQLite
+    storage, not Telegram delivery. Enable the optional receiver behind your HTTPS proxy.
+servers:
+  - url: https://sentinel.example.test
+    description: Replace with your HTTPS reverse proxy URL.
+security:
+  - sourceToken: []
+tags:
+  - name: Events
+    description: Source-reported notifications and incident lifecycles.
+paths:
+  /api/v1/events:
+    post:
+      tags: [Events]
+      operationId: submitEvent
+      summary: Accept one technical event
+      description: >-
+        Authenticate one configured source before reading its JSON body. An immutable
+        retry returns the original receipt; changed content under the same source/ID
+        returns 409. Unknown fields and query parameters are rejected. The body cannot
+        select sources, recipients or network targets. Generate a current UTC event
+        timestamp and a unique UUID before using the illustrative examples. Malformed
+        protocol framing may be rejected by the proxy or parser before JSON handling.
+      x-max-body-bytes: 16384
+      requestBody:
+        required: true
+        description: One JSON object, at most 16 KiB by default; no compressed bodies.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Event'
+            examples:
+              notification:
+                summary: Send one independent alert
+                value:
+                  event_id: 1b551feb-b28b-4176-9396-d2b76af7e422
+                  occurred_at: '2026-10-20T12:00:00Z'
+                  kind: notification
+                  type: security.attack
+                  severity: warning
+                  summary: Source detector reported an unusual request rate.
+              firing:
+                summary: Open one incident occurrence
+                value:
+                  event_id: 4a1e13b2-8b9a-40ae-bcad-8ebdf0fc1793
+                  occurred_at: '2026-10-20T12:00:00Z'
+                  kind: firing
+                  type: service.health
+                  severity: critical
+                  summary: Worker stopped responding.
+                  incident_key: worker-7f829032
+              resolved:
+                summary: Resolve that occurrence
+                value:
+                  event_id: bf6b8bcb-ed98-4784-9915-13d9b6e80693
+                  occurred_at: '2026-10-20T12:05:00Z'
+                  kind: resolved
+                  type: service.health
+                  severity: info
+                  summary: Worker is responding again.
+                  incident_key: worker-7f829032
+      responses:
+        '202':
+          description: Receipt, lifecycle decision and required deliveries durably committed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Receipt'
+              example:
+                event_id: 4a1e13b2-8b9a-40ae-bcad-8ebdf0fc1793
+                received_at: '2026-10-20T12:00:01+00:00'
+                outcome: opened
+        '400':
+          description: Malformed JSON, invalid schema, duplicate keys or query parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid source token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Event type is not permitted for the authenticated source.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Unknown route; no other public API routes are provided.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '405':
+          description: Wrong HTTP method; this route accepts POST only.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '408':
+          description: Request body read deadline exceeded; retry the same event.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: A retained event ID has different canonical content.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Request body exceeds the configured byte limit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          description: Content-Type must be application/json; compressed bodies are unsupported.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          description: Invalid event time or lifecycle; inspect occurrence ordering and type.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Global or source request budget exhausted; honor Retry-After.
+          headers:
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Concurrency, durable storage or admission capacity unavailable; retry later.
+          headers:
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Unexpected application failure; acceptance is unknown, retry the immutable event.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+components:
+  securitySchemes:
+    sourceToken:
+      type: http
+      scheme: bearer
+      description: Distinct operator-configured source token; never sent as a query parameter.
+  headers:
+    RetryAfter:
+      description: Bounded wait in seconds before retrying the same immutable event.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 60
+  schemas:
+    Event:
+      type: object
+      additionalProperties: false
+      required: [event_id, occurred_at, kind, type, severity, summary]
+      properties:
+        event_id:
+          type: string
+          format: uuid
+          pattern: '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
+          description: Immutable event identity, scoped to its authenticated source.
+        occurred_at:
+          type: string
+          format: date-time
+          pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?(Z|\+00:00)$'
+          description: UTC event time; default new-event window is 24 hours old to 5 minutes ahead.
+        kind:
+          type: string
+          enum: [notification, firing, resolved]
+          description: One-shot alert, occurrence opening or occurrence resolution.
+        type:
+          type: string
+          pattern: '^[a-z][a-z0-9_.-]{0,63}$'
+          maxLength: 64
+          description: Technical identifier from this source's configured allowlist.
+        severity:
+          type: string
+          enum: [info, warning, critical]
+          description: Sender-assigned severity; it cannot change notification destinations.
+        summary:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Nonblank single-line plain text; control characters and line separators are rejected.
+        incident_key:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$'
+          maxLength: 128
+          description: Unique occurrence key; required for lifecycle events, absent for notification.
+      if:
+        properties:
+          kind:
+            const: notification
+      then:
+        not:
+          required: [incident_key]
+      else:
+        required: [incident_key]
+    Receipt:
+      type: object
+      additionalProperties: false
+      required: [event_id, received_at, outcome]
+      description: Original durable acceptance result, returned unchanged on an identical retry.
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        received_at:
+          type: string
+          format: date-time
+          description: UTC time of the first durable acceptance.
+        outcome:
+          type: string
+          enum: [notification, opened, resolved, noop]
+          description: Lifecycle decision; noop also represents a durably accepted terminal report.
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code]
+          properties:
+            code:
+              type: string
+              description: Safe error category; no raw request or transport details.
+              enum:
+                - schema
+                - event_time
+                - lifecycle
+                - conflict
+                - capacity
+                - event_type
+                - unauthorized
+                - rate_limited
+                - body_too_large
+                - content_type
+                - body_timeout
+                - not_found
+                - method_not_allowed
+                - unavailable
+                - internal

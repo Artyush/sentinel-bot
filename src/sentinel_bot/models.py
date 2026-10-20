@@ -80,6 +80,9 @@ class EventKind(StrEnum):
     DOWN = "DOWN"
     RECOVERY = "RECOVERY"
     REMINDER = "REMINDER"
+    NOTIFICATION = "NOTIFICATION"
+    FIRING = "FIRING"
+    RESOLVED = "RESOLVED"
 
 
 @dataclass(frozen=True)
@@ -88,10 +91,16 @@ class Event:
     incident_id: str
     occurred_at: datetime
     started_at: datetime
+    summary: str | None = None
+    severity: str | None = None
+    event_type: str | None = None
+    received_at: datetime | None = None
 
     def __post_init__(self) -> None:
         require_aware(self.occurred_at)
         require_aware(self.started_at)
+        if self.received_at is not None:
+            require_aware(self.received_at)
         if not self.incident_id:
             raise ValueError("An incident event requires its identity")
 

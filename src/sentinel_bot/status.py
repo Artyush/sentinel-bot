@@ -15,6 +15,7 @@ def status_snapshot(settings: Settings) -> dict[str, object]:
     progress = observation_progress(settings)
     now = time.monotonic()
     sites: list[dict[str, object]] = []
+    source_modes = {source.alias: source.mode for source in settings.sources}
     for site in settings.sites:
         if not site.enabled:
             continue
@@ -60,4 +61,13 @@ def status_snapshot(settings: Settings) -> dict[str, object]:
         "sites": sites,
         "pending_notifications": store.pending_count(),
         "telegram": {"enabled": settings.telegram is not None, **store.delivery_status()},
+        "ingress": {"enabled": settings.ingress is not None},
+        "sources": [
+            {
+                **source_status,
+                "mode": source_modes[str(source_status["alias"])],
+                "availability": "UNKNOWN",
+            }
+            for source_status in store.incoming_status(tuple(source_modes))
+        ],
     }

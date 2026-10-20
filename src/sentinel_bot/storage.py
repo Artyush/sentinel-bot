@@ -9,11 +9,19 @@ import sqlite3
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
-from sentinel_bot.config import SiteConfig
+from sentinel_bot.config import IngressSettings, PushSource, SiteConfig
+from sentinel_bot.events import (
+    EventRejected,
+    IncomingEvent,
+    IncomingReceipt,
+    OccurrenceState,
+    decide_event,
+    validate_event_time,
+)
 from sentinel_bot.models import (
     CheckResult,
     ErrorKind,
@@ -26,10 +34,11 @@ from sentinel_bot.models import (
 from sentinel_bot.policy import apply_observation as decide_observation
 from sentinel_bot.policy import due_reminder
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DATABASE_NAME = "state.sqlite3"
 HISTORY_LIMIT = 200
 MAX_PENDING_NOTIFICATIONS = 80
+MAX_PENDING_PUSH_NOTIFICATIONS = 1000
 MAX_IN_FLIGHT_NOTIFICATIONS = 20
 MAX_RETRY_DELAY_SECONDS = 7 * 86400
 
@@ -135,7 +144,7 @@ def _upgrade_schema(connection: sqlite3.Connection) -> None:
                 startup_count INTEGER NOT NULL CHECK (startup_count > 0)
             )"""
         )
-    elif version not in (1, 2, SCHEMA_VERSION):
+    elif version not in (1, 2, 3, SCHEMA_VERSION):
         raise StorageError(f"Unsupported state schema version {version}; expected {SCHEMA_VERSION}")
     if version == 1:
         row = connection.execute(
@@ -148,6 +157,8 @@ def _upgrade_schema(connection: sqlite3.Connection) -> None:
         _create_monitoring_schema(connection)
     if version < 3:
         _create_delivery_schema(connection)
+    if version < 4:
+        _create_ingress_schema(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     for query in (
         "SELECT alias, fingerprint, state, observation, delivery_destination, opening_id, "
@@ -161,10 +172,49 @@ def _upgrade_schema(connection: sqlite3.Connection) -> None:
         "SELECT singleton, destination, pause_until, pause_delay_seconds, last_error "
         "FROM telegram_route LIMIT 0",
         "SELECT bot_id, next_offset, received_at FROM telegram_updates LIMIT 0",
+        "SELECT source_alias, event_id, fingerprint, received_at, occurred_at, outcome "
+        "FROM event_receipts LIMIT 0",
+        "SELECT source_alias, incident_key, event_type, opened_at, resolved_at, retained_at, "
+        "destination, opening_id, opening_failed FROM pushed_incidents LIMIT 0",
+        "SELECT source_alias, received_at, occurred_at FROM push_sources LIMIT 0",
     ):
         connection.execute(query)
     if connection.execute("SELECT 1 FROM telegram_route WHERE singleton = 1").fetchone() is None:
         raise StorageError("Telegram route metadata is missing")
+
+
+def _create_ingress_schema(connection: sqlite3.Connection) -> None:
+    for statement in (
+        """CREATE TABLE event_receipts (
+            source_alias TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            PRIMARY KEY (source_alias, event_id)
+        )""",
+        "CREATE INDEX receipt_retention ON event_receipts (received_at)",
+        """CREATE TABLE pushed_incidents (
+            source_alias TEXT NOT NULL,
+            incident_key TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            opened_at TEXT,
+            resolved_at TEXT,
+            retained_at TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            opening_id TEXT,
+            opening_failed INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (source_alias, incident_key)
+        )""",
+        "CREATE INDEX tombstone_retention ON pushed_incidents (resolved_at, retained_at)",
+        """CREATE TABLE push_sources (
+            source_alias TEXT PRIMARY KEY,
+            received_at TEXT,
+            occurred_at TEXT
+        )""",
+    ):
+        connection.execute(statement)
 
 
 def _create_delivery_schema(connection: sqlite3.Connection) -> None:
@@ -312,15 +362,20 @@ def _encode_observation(observation: Observation) -> str:
 
 
 def _encode_event(event: Event) -> str:
-    return json.dumps(
-        {
-            "kind": event.kind.value,
-            "incident_id": event.incident_id,
-            "occurred_at": _timestamp(event.occurred_at),
-            "started_at": _timestamp(event.started_at),
-        },
-        separators=(",", ":"),
-    )
+    document: dict[str, object] = {
+        "kind": event.kind.value,
+        "incident_id": event.incident_id,
+        "occurred_at": _timestamp(event.occurred_at),
+        "started_at": _timestamp(event.started_at),
+    }
+    if event.summary is not None:
+        document.update(
+            summary=event.summary,
+            severity=event.severity,
+            event_type=event.event_type,
+            received_at=_optional_timestamp(event.received_at),
+        )
+    return json.dumps(document, separators=(",", ":"))
 
 
 def _optional_timestamp(value: datetime | None) -> str | None:
@@ -394,6 +449,10 @@ def _decode_event(raw: str) -> Event:
         _text(data["incident_id"]),
         _datetime(data["occurred_at"]),
         _datetime(data["started_at"]),
+        None if data.get("summary") is None else _text(data["summary"]),
+        None if data.get("severity") is None else _text(data["severity"]),
+        None if data.get("event_type") is None else _text(data["event_type"]),
+        _optional_datetime(data.get("received_at")),
     )
 
 
@@ -528,6 +587,7 @@ class SQLiteStore:
         connection.execute(
             """DELETE FROM notification_outbox
             WHERE source_alias = ? AND delivered_at IS NULL AND in_flight = 0
+            AND kind IN ('DOWN', 'RECOVERY', 'REMINDER')
             AND attempts = 0 AND failed_at IS NULL AND blocked_by IS NULL""",
             (alias,),
         )
@@ -617,6 +677,7 @@ class SQLiteStore:
             connection.execute(
                 """DELETE FROM notification_outbox WHERE source_alias = ?
                 AND destination = ? AND incident_id != ?
+                AND kind IN ('DOWN', 'RECOVERY', 'REMINDER')
                 AND delivered_at IS NULL AND in_flight = 0
                 AND attempts = 0 AND failed_at IS NULL AND blocked_by IS NULL""",
                 (alias, destination, event.incident_id),
@@ -630,7 +691,8 @@ class SQLiteStore:
                 (alias, destination),
             )
         pending = connection.execute(
-            "SELECT COUNT(*) FROM notification_outbox WHERE delivered_at IS NULL "
+            "SELECT COUNT(*) FROM notification_outbox WHERE kind IN ('DOWN', 'RECOVERY', 'REMINDER') "
+            "AND delivered_at IS NULL "
             "AND failed_at IS NULL AND blocked_by IS NULL"
         ).fetchone()[0]
         if blocked_by is None and not unavailable_route and pending >= MAX_PENDING_NOTIFICATIONS:
@@ -661,6 +723,279 @@ class SQLiteStore:
                 (destination, notification_id, alias),
             )
         SQLiteStore._prune_history(connection)
+
+    def reconcile_push_sources(self, sources: Sequence[PushSource]) -> None:
+        """Bound the status cache without removing accepted events or occurrences."""
+        aliases = tuple(source.alias for source in sources)
+        if len(aliases) > 20 or len(set(aliases)) != len(aliases):
+            raise ValueError("Push inventory requires at most 20 unique aliases")
+        with self._transaction() as connection:
+            for row in connection.execute("SELECT source_alias FROM push_sources").fetchall():
+                if row[0] not in aliases:
+                    connection.execute("DELETE FROM push_sources WHERE source_alias = ?", (row[0],))
+            for alias in aliases:
+                connection.execute(
+                    "INSERT OR IGNORE INTO push_sources (source_alias) VALUES (?)", (alias,)
+                )
+
+    @staticmethod
+    def _prune_event_retention(
+        connection: sqlite3.Connection, now: datetime, retention: float
+    ) -> None:
+        cutoff = _timestamp(now - timedelta(seconds=retention))
+        connection.execute("DELETE FROM event_receipts WHERE received_at < ?", (cutoff,))
+        connection.execute(
+            "DELETE FROM pushed_incidents WHERE resolved_at IS NOT NULL AND retained_at < ?",
+            (cutoff,),
+        )
+
+    @staticmethod
+    def _event_capacity(
+        connection: sqlite3.Connection,
+        alias: str,
+        limits: IngressSettings,
+        *,
+        active_delta: int,
+        tombstone_delta: int,
+        delivery_delta: int,
+    ) -> None:
+        for source in (None, alias):
+            condition = "" if source is None else " WHERE source_alias = ?"
+            values = () if source is None else (source,)
+            receipts = connection.execute(
+                "SELECT COUNT(*) FROM event_receipts" + condition, values
+            ).fetchone()[0]
+            active, tombstones = connection.execute(
+                "SELECT COUNT(*) FILTER (WHERE resolved_at IS NULL), "
+                "COUNT(*) FILTER (WHERE resolved_at IS NOT NULL) FROM pushed_incidents" + condition,
+                values,
+            ).fetchone()
+            pending = connection.execute(
+                "SELECT COUNT(*) FROM notification_outbox "
+                "WHERE kind IN ('NOTIFICATION', 'FIRING', 'RESOLVED') "
+                "AND delivered_at IS NULL AND failed_at IS NULL AND blocked_by IS NULL"
+                + ("" if source is None else " AND source_alias = ?"),
+                values,
+            ).fetchone()[0]
+            maxima = (
+                (
+                    limits.max_receipts,
+                    limits.max_tombstones,
+                    limits.max_pending,
+                    limits.max_active_incidents,
+                )
+                if source is None
+                else (
+                    limits.max_receipts_per_source,
+                    limits.max_tombstones_per_source,
+                    limits.max_pending_per_source,
+                    limits.max_active_incidents_per_source,
+                )
+            )
+            # Every active occurrence owns a future resolution receipt, tombstone
+            # and delivery slot; one-shots must not spend those reservations.
+            if any(
+                count > maximum
+                for count, maximum in zip(
+                    (
+                        receipts + 1 + active + active_delta,
+                        tombstones + tombstone_delta + active + active_delta,
+                        pending + delivery_delta + active + active_delta,
+                        active + active_delta,
+                    ),
+                    maxima,
+                    strict=True,
+                )
+            ):
+                raise EventRejected("capacity")
+
+    def accept_event(
+        self,
+        source: PushSource,
+        event: IncomingEvent,
+        received_at: datetime,
+        limits: IngressSettings,
+    ) -> IncomingReceipt:
+        """Commit one immutable receipt, lifecycle decision and fixed-route delivery.
+
+        Retained duplicates precede new-event permission, time and capacity checks.
+        A returned receipt describes durable acceptance, never provider delivery.
+        """
+        timestamp = _timestamp(received_at)
+        with self._transaction() as connection:
+            previous_receipt = connection.execute(
+                "SELECT * FROM event_receipts WHERE source_alias = ? AND event_id = ?",
+                (source.alias, event.event_id),
+            ).fetchone()
+            if previous_receipt is not None:
+                if previous_receipt["fingerprint"] != event.fingerprint:
+                    raise EventRejected("conflict")
+                return IncomingReceipt(
+                    event.event_id,
+                    _datetime(previous_receipt["received_at"]),
+                    previous_receipt["outcome"],
+                )
+            if event.event_type not in source.allowed_types:
+                raise EventRejected("event_type")
+            validate_event_time(event, received_at, limits.max_event_age, limits.future_skew)
+            self._prune_event_retention(connection, received_at, limits.retention)
+            occurrence = None
+            if event.incident_key is not None:
+                occurrence = connection.execute(
+                    "SELECT * FROM pushed_incidents WHERE source_alias = ? AND incident_key = ?",
+                    (source.alias, event.incident_key),
+                ).fetchone()
+            previous = (
+                None
+                if occurrence is None
+                else OccurrenceState(
+                    occurrence["event_type"],
+                    _optional_datetime(occurrence["opened_at"]),
+                    _optional_datetime(occurrence["resolved_at"]),
+                )
+            )
+            decision = decide_event(event, previous)
+            closing_active = (
+                previous is not None
+                and previous.resolved_at is None
+                and decision.state is not None
+                and decision.state.resolved_at is not None
+            )
+            opening = previous is None and event.kind == "firing"
+            tombstone = decision.state is not None and decision.state.resolved_at is not None
+            if not closing_active:
+                self._event_capacity(
+                    connection,
+                    source.alias,
+                    limits,
+                    active_delta=int(opening),
+                    tombstone_delta=int(tombstone and previous is None),
+                    delivery_delta=int(decision.notify),
+                )
+            route = connection.execute(
+                "SELECT destination FROM telegram_route WHERE singleton = 1"
+            ).fetchone()
+            current_destination = None if route is None else route[0]
+            destination = (
+                occurrence["destination"]
+                if occurrence is not None
+                else current_destination or "operator"
+            )
+            notification_id = str(uuid4()) if decision.notify else None
+            if decision.state is not None:
+                state = decision.state
+                connection.execute(
+                    """INSERT INTO pushed_incidents
+                    (source_alias, incident_key, event_type, opened_at, resolved_at,
+                    retained_at, destination, opening_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source_alias, incident_key) DO UPDATE SET
+                    resolved_at = excluded.resolved_at,
+                    retained_at = CASE WHEN pushed_incidents.resolved_at IS NULL
+                        AND excluded.resolved_at IS NOT NULL THEN excluded.retained_at
+                        ELSE pushed_incidents.retained_at END""",
+                    (
+                        source.alias,
+                        event.incident_key,
+                        state.event_type,
+                        _optional_timestamp(state.opened_at),
+                        _optional_timestamp(state.resolved_at),
+                        timestamp,
+                        destination,
+                        notification_id if opening else None,
+                    ),
+                )
+            if notification_id is not None:
+                blocked_by = (
+                    occurrence["opening_id"]
+                    if closing_active and occurrence is not None and occurrence["opening_failed"]
+                    else None
+                )
+                unavailable = current_destination is not None and destination != current_destination
+                outgoing = Event(
+                    EventKind(event.kind.upper()),
+                    event.incident_key or event.event_id,
+                    event.occurred_at,
+                    event.occurred_at
+                    if decision.state is None or decision.state.opened_at is None
+                    else decision.state.opened_at,
+                    event.summary,
+                    event.severity,
+                    event.event_type,
+                    received_at,
+                )
+                connection.execute(
+                    """INSERT INTO notification_outbox
+                    (notification_id, source_alias, destination, incident_id, kind, event,
+                    blocked_by, failed_at, last_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        notification_id,
+                        source.alias,
+                        destination,
+                        outgoing.incident_id,
+                        outgoing.kind.value,
+                        _encode_event(outgoing),
+                        blocked_by,
+                        timestamp if unavailable and blocked_by is None else None,
+                        "opening_failed"
+                        if blocked_by is not None
+                        else "destination_changed"
+                        if unavailable
+                        else None,
+                    ),
+                )
+            connection.execute(
+                "INSERT INTO event_receipts VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    source.alias,
+                    event.event_id,
+                    event.fingerprint,
+                    timestamp,
+                    _timestamp(event.occurred_at),
+                    decision.outcome,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO push_sources VALUES (?, ?, ?)
+                ON CONFLICT(source_alias) DO UPDATE SET received_at = excluded.received_at,
+                occurred_at = excluded.occurred_at""",
+                (source.alias, timestamp, _timestamp(event.occurred_at)),
+            )
+            self._prune_history(connection)
+            return IncomingReceipt(event.event_id, received_at.astimezone(UTC), decision.outcome)
+
+    def incoming_status(self, aliases: Sequence[str]) -> tuple[dict[str, object], ...]:
+        """Read cached push activity without treating silence as healthy."""
+        if len(aliases) > 20 or len(set(aliases)) != len(aliases):
+            raise ValueError("Push status requires at most 20 unique aliases")
+        with self._transaction() as connection:
+            result: list[dict[str, object]] = []
+            for alias in aliases:
+                last = connection.execute(
+                    "SELECT received_at, occurred_at FROM push_sources WHERE source_alias = ?",
+                    (alias,),
+                ).fetchone()
+                active = connection.execute(
+                    "SELECT COUNT(*) FROM pushed_incidents WHERE source_alias = ? "
+                    "AND resolved_at IS NULL",
+                    (alias,),
+                ).fetchone()[0]
+                pending = connection.execute(
+                    "SELECT COUNT(*) FROM notification_outbox WHERE source_alias = ? "
+                    "AND kind IN ('NOTIFICATION', 'FIRING', 'RESOLVED') "
+                    "AND delivered_at IS NULL AND failed_at IS NULL AND blocked_by IS NULL",
+                    (alias,),
+                ).fetchone()[0]
+                result.append(
+                    {
+                        "alias": alias,
+                        "last_received_at": None if last is None else last[0],
+                        "last_event_at": None if last is None else last[1],
+                        "active_incidents": active,
+                        "pending_notifications": pending,
+                    }
+                )
+            return tuple(result)
 
     def pending_notifications(self) -> tuple[OutboxRecord, ...]:
         with self._transaction() as connection:
@@ -716,6 +1051,13 @@ class SQLiteStore:
                         AND destination = ?)""",
                     (destination, destination),
                 )
+                connection.execute(
+                    """UPDATE pushed_incidents SET destination = ?
+                    WHERE destination = 'operator' AND EXISTS
+                    (SELECT 1 FROM notification_outbox
+                    WHERE notification_id = pushed_incidents.opening_id AND destination = ?)""",
+                    (destination, destination),
+                )
             connection.execute(
                 """UPDATE notification_outbox SET in_flight = 0,
                 attempts = MAX(attempts, 1), next_attempt_at = ?, last_error = 'interrupted'
@@ -745,6 +1087,7 @@ class SQLiteStore:
         connection.execute(
             """DELETE FROM notification_outbox AS old
             WHERE old.destination = ? AND old.delivered_at IS NULL
+            AND old.kind IN ('DOWN', 'RECOVERY', 'REMINDER')
             AND old.failed_at IS NULL AND old.blocked_by IS NULL
             AND old.in_flight = 0 AND old.attempts = 0
             AND EXISTS (SELECT 1 FROM notification_outbox AS latest
@@ -767,7 +1110,9 @@ class SQLiteStore:
         terminal state, in-flight capacity, or DOWN-before-RECOVERY ordering.
         """
         timestamp = _timestamp(now)
-        if ready_ids is not None and len(ready_ids) > MAX_PENDING_NOTIFICATIONS:
+        if ready_ids is not None and len(ready_ids) > (
+            MAX_PENDING_NOTIFICATIONS + MAX_PENDING_PUSH_NOTIFICATIONS
+        ):
             raise ValueError("Too many delivery candidates")
         with self._transaction() as connection:
             in_flight = connection.execute(
@@ -880,6 +1225,24 @@ class SQLiteStore:
                 WHERE alias = ? AND delivery_destination = ?
                 AND json_extract(state, '$.incident_id') = ?""",
                 (row["source_alias"], row["destination"], row["incident_id"]),
+            )
+        elif row["kind"] == EventKind.FIRING.value:
+            connection.execute(
+                "UPDATE pushed_incidents SET opening_failed = 1 WHERE opening_id = ?",
+                (row["notification_id"],),
+            )
+            connection.execute(
+                """UPDATE notification_outbox SET blocked_by = ?, in_flight = 0,
+                next_attempt_at = NULL, last_error = 'opening_failed'
+                WHERE source_alias = ? AND destination = ? AND incident_id = ?
+                AND kind = 'RESOLVED' AND delivered_at IS NULL
+                AND failed_at IS NULL AND in_flight = 0""",
+                (
+                    row["notification_id"],
+                    row["source_alias"],
+                    row["destination"],
+                    row["incident_id"],
+                ),
             )
 
     def fail_delivery(self, notification_id: str, failed_at: datetime, error: str) -> None:

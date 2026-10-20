@@ -27,6 +27,7 @@ COPY --from=builder /opt/application/ /opt/application/
 COPY config/idle.toml /app/config.toml
 COPY config/idle.toml config/demo.toml config/sites.example.toml config/telegram.example.toml /app/config/
 COPY config/checks.example.toml /app/config/checks.example.toml
+COPY config/ingress.example.toml /app/config/ingress.example.toml
 COPY demo/site_fixture.py /app/demo/site_fixture.py
 
 USER 10001:10001

@@ -1,0 +1,7 @@
+services:
+  sentinel:
+    environment:
+      SENTINEL_CONFIG: /app/config/ingress.example.toml
+      SENTINEL_SOURCE_APP_TOKEN: ${SENTINEL_SOURCE_APP_TOKEN:-}
+    expose:
+      - "8080"
