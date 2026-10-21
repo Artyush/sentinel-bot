@@ -465,7 +465,7 @@ def test_real_application_keeps_other_channel_checks_and_ingress_running(
     bot, checker = Telegram(), Checker()
     monkeypatch.setattr(telegram, "TelegramAPI", lambda _: bot)
     monkeypatch.setattr(telegram, "SEND_INTERVAL", 0)
-    monkeypatch.setattr(monitoring, "HttpChecker", lambda *args: checker)
+    monkeypatch.setattr(monitoring, "HttpChecker", lambda *args, **kwargs: checker)
 
     async def scenario():
         task = asyncio.create_task(runtime.run(settings))
@@ -488,12 +488,16 @@ def test_real_application_keeps_other_channel_checks_and_ingress_running(
                     receipt = await response.json()
             if outage == "email":
                 await until(
-                    lambda: bool(bot.accepted) and store.email_delivery_status()["paused"], task
+                    lambda: (
+                        store.delivery_status()["accepted"] == 1
+                        and store.email_delivery_status()["paused"]
+                    ),
+                    task,
                 )
                 assert len(provider.calls) == 1
                 assert store.email_pending_count() == 2
             else:
-                await until(lambda: len(provider.accepted) == 2, task)
+                await until(lambda: store.email_delivery_status()["accepted"] == 2, task)
                 assert not bot.accepted
                 assert len(store.pending_notifications()) == 1
             assert runtime.healthcheck(settings)
@@ -505,7 +509,13 @@ def test_real_application_keeps_other_channel_checks_and_ingress_running(
         bot.broken = False
         task = asyncio.create_task(runtime.run(settings))
         try:
-            await until(lambda: len(provider.accepted) == 2 and len(bot.accepted) == 1, task)
+            await until(
+                lambda: (
+                    store.email_delivery_status()["accepted"] == 2
+                    and store.delivery_status()["accepted"] == 1
+                ),
+                task,
+            )
             async with aiohttp.ClientSession() as client:
                 async with client.post(
                     url, headers={"Authorization": "Bearer " + source.token}, json=payload
@@ -522,6 +532,7 @@ def test_real_application_keeps_other_channel_checks_and_ingress_running(
         finally:
             await cancel(task)
         assert provider.closed == bot.closed == 2
+        assert len(bot.accepted) == 1
         assert Counter(item[0] for item in provider.accepted) == {FIRST: 1, SECOND: 1}
 
     asyncio.run(scenario())

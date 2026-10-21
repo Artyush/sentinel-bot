@@ -31,6 +31,7 @@ def main() -> None:
                 "SENTINEL_TELEGRAM_ALLOWED_USER_IDS": "",
                 "SENTINEL_TELEGRAM_TOPIC_ID": "",
                 "SENTINEL_SOURCE_APP_TOKEN": "",
+                "SENTINEL_SERVER_NODE_TOKEN": "",
                 "SENTINEL_EMAIL_API_KEY": "",
                 "SENTINEL_EMAIL_FROM": "",
                 "SENTINEL_EMAIL_RECIPIENTS": "",

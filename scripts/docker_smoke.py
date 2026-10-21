@@ -29,6 +29,7 @@ def command(*args: str, expected: int = 0, timeout: float = 120) -> str:
             "SENTINEL_EMAIL_FROM": "",
             "SENTINEL_EMAIL_RECIPIENTS": "",
             "SENTINEL_SOURCE_APP_TOKEN": "",
+            "SENTINEL_SERVER_NODE_TOKEN": "",
         },
         capture_output=True,
         text=True,

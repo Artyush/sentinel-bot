@@ -7,9 +7,9 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-m", "sentinel_bot", "healthcheck"]
-      interval: 1s
-      timeout: 3s
-      start_period: 1s
+      interval: 5s
+      timeout: 8s
+      start_period: 15s
       retries: 3
 
   site-fixture:

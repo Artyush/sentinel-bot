@@ -66,13 +66,17 @@ class HttpChecker:
     """
 
     def __init__(
-        self, max_concurrency: int = 5, fixture_hosts: frozenset[str] = frozenset()
+        self,
+        max_concurrency: int = 5,
+        fixture_hosts: frozenset[str] = frozenset(),
+        *,
+        semaphore: asyncio.Semaphore | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("HTTP concurrency must be positive")
         self._max_concurrency = max_concurrency
         self._fixture_hosts = fixture_hosts
-        self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._semaphore = asyncio.Semaphore(max_concurrency) if semaphore is None else semaphore
         self._session: aiohttp.ClientSession | None = None
         self._resolver: PublicAddressResolver | None = None
 

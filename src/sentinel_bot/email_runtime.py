@@ -95,7 +95,7 @@ async def _deliver(
     suspended = False
     next_send = time.monotonic() + SEND_INTERVAL
     retries = {item.id: restored_at + float(item.retry_delay_seconds or 0) for item in restored}
-    sites = {site.alias: site for site in settings.sites}
+    sites = {site.alias: site for site in settings.polled_rules}
     destinations = frozenset(config.destinations)
     while not stopped.is_set():
         progress.email["delivery"] = time.monotonic()
@@ -234,7 +234,7 @@ async def _reminders(
 ) -> None:
     config = settings.email
     assert config is not None
-    sites = {site.alias: site for site in settings.sites}
+    sites = {site.alias: site for site in settings.polled_rules}
     while not stopped.is_set():
         progress.email["reminders"] = time.monotonic()
         records = await _state(lock, store.email_reminder_progress)

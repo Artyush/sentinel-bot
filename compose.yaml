@@ -24,6 +24,7 @@ services:
       SENTINEL_EMAIL_API_KEY: ${SENTINEL_EMAIL_API_KEY:-}
       SENTINEL_EMAIL_FROM: ${SENTINEL_EMAIL_FROM:-}
       SENTINEL_EMAIL_RECIPIENTS: ${SENTINEL_EMAIL_RECIPIENTS:-}
+      SENTINEL_SERVER_NODE_TOKEN: ${SENTINEL_SERVER_NODE_TOKEN:-}
     volumes:
       - sentinel-state:/var/lib/sentinel
     tmpfs:

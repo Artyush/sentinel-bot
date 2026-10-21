@@ -99,7 +99,7 @@ def test_schema_two_upgrade_preserves_pending_accepted_events_and_startups(tmp_p
                 (identity, event, delivered),
             )
     startup = initialize_state(tmp_path, NOW + timedelta(days=1))
-    assert startup.schema_version == 5 and startup.startup_count == 8
+    assert startup.schema_version == 6 and startup.startup_count == 8
     assert startup.first_started_at == NOW.isoformat()
     store = SQLiteStore(tmp_path)
     before = store.pending_notifications()[0]

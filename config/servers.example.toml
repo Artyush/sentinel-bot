@@ -1,0 +1,41 @@
+# Provision Node Exporter and its HTTPS Bearer-auth proxy separately.
+# Configuration reference: ../docs/configuration.md#linux-servers-servers
+[runtime]
+mode = "monitor"
+state_dir = "data"
+heartbeat_interval_seconds = 1
+health_timeout_seconds = 5
+shutdown_timeout_seconds = 5
+max_concurrency = 5
+
+[telegram]
+enabled = false
+
+# Enable Telegram or email explicitly to deliver resource incidents.
+# Without a channel, incidents remain in the bounded logical operator queue.
+[[servers]]
+alias = "node"
+url = "https://node.example.test/metrics"
+token_env = "SENTINEL_SERVER_NODE_TOKEN"
+# Public addresses are allowed. Add only the private CIDRs this source requires:
+# allowed_cidrs = ["10.20.0.10/32"]
+poll_interval_seconds = 30
+connect_timeout_seconds = 5
+total_timeout_seconds = 10
+failure_confirmation = 3
+recovery_confirmation = 2
+reminder_interval_seconds = 1800
+cpu_alerts = true
+cpu_trigger_percent = 85
+cpu_recovery_percent = 75
+memory_alerts = true
+memory_trigger_percent = 85
+memory_recovery_percent = 75
+enabled = true
+
+[[servers.filesystems]]
+alias = "root"
+mount = "/"
+trigger_percent = 85
+recovery_percent = 75
+alerts = true

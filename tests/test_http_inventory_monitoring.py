@@ -95,8 +95,10 @@ enabled = false
         origin = f"http://127.0.0.1:{runner.addresses[0][1]}"
 
         class FixtureChecker:
-            def __init__(self, max_concurrency, fixture_hosts):
-                self.inner = HttpChecker(max_concurrency, frozenset({"127.0.0.1"}))
+            def __init__(self, max_concurrency, fixture_hosts, *, semaphore=None):
+                self.inner = HttpChecker(
+                    max_concurrency, frozenset({"127.0.0.1"}), semaphore=semaphore
+                )
 
             async def __aenter__(self):
                 await self.inner.__aenter__()

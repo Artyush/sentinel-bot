@@ -127,8 +127,13 @@ async def scenario() -> None:
         instances.append(api)
         return api
 
-    def checker_factory(max_concurrency: int, fixture_hosts: frozenset[str]) -> HttpChecker:
-        return HttpChecker(max_concurrency, frozenset({"127.0.0.1"}))
+    def checker_factory(
+        max_concurrency: int,
+        fixture_hosts: frozenset[str],
+        *,
+        semaphore: asyncio.Semaphore | None = None,
+    ) -> HttpChecker:
+        return HttpChecker(max_concurrency, frozenset({"127.0.0.1"}), semaphore=semaphore)
 
     telegram_runtime.TelegramAPI = api_factory
     monitoring.HttpChecker = checker_factory

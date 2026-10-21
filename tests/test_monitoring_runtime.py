@@ -50,7 +50,7 @@ def settings_for(tmp_path: Path) -> Settings:
 
 
 class FailingChecker:
-    def __init__(self, *args: object) -> None:
+    def __init__(self, *args: object, **kwargs: object) -> None:
         self.closed = False
 
     async def __aenter__(self) -> FailingChecker:

@@ -5,6 +5,7 @@ info:
   description: >-
     Submit technical events from configured sources. Acceptance means durable SQLite
     storage for all configured channels, not Telegram or inbox delivery. Enable the optional receiver behind your HTTPS proxy.
+    Node Exporter polling is configured separately; this endpoint does not accept raw metrics or change polling state.
 servers:
   - url: https://sentinel.example.test
     description: Replace with your HTTPS reverse proxy URL.
