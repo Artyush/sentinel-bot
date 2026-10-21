@@ -15,8 +15,11 @@
 !config/ingress.example.toml
 !config/email.example.toml
 !config/email.local.toml
+!config/servers.example.toml
+!config/servers.local.toml
 !demo/
 !demo/site_fixture.py
+!demo/metrics_fixture.py
 src/**/__pycache__/
 src/**/*.pyc
 src/**/*.pyo

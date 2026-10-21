@@ -465,7 +465,7 @@ def test_real_application_keeps_other_channel_checks_and_ingress_running(
     bot, checker = Telegram(), Checker()
     monkeypatch.setattr(telegram, "TelegramAPI", lambda _: bot)
     monkeypatch.setattr(telegram, "SEND_INTERVAL", 0)
-    monkeypatch.setattr(monitoring, "HttpChecker", lambda *args: checker)
+    monkeypatch.setattr(monitoring, "HttpChecker", lambda *args, **kwargs: checker)
 
     async def scenario():
         task = asyncio.create_task(runtime.run(settings))

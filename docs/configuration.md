@@ -1,12 +1,12 @@
 # Configuration reference
 
-Use TOML for non-secret runtime settings and the website inventory. Use environment variables for channel credentials, email addresses and Telegram destinations. See the [running guide](running.md) for launch commands and local verification.
+Use TOML for non-secret runtime settings and website/server inventories. Use environment variables for channel/exporter credentials, email addresses and Telegram destinations. See the [running guide](running.md) for launch commands and local verification.
 
-Website monitoring, incoming events, Telegram delivery, independent incident email and cached commands are implemented. Linux metrics have no supported configuration yet. The local SMTP command remains a separate development check. The [API guide](api.md) describes incoming request and response semantics.
+Website monitoring, Linux Node Exporter metrics, incoming events, Telegram delivery, independent incident email and cached commands are implemented. The local SMTP command remains a separate development check. The [API guide](api.md) describes incoming request and response semantics.
 
 ## Configuration loading
 
-The main configuration must be valid UTF-8 TOML, at most **16 KiB**. Supported sections are `[runtime]`, optional `[telegram]`, `[email]`, `[ingress]`, `[[sources]]` and inline `[[sites]]`. Set `runtime.sites_file` to load endpoint tables from a separate file instead; each file has its own 16 KiB limit. Unknown sections or keys fail validation. Durations accept finite integers or floats; counts require integers, not booleans. All ranges below are inclusive unless stated otherwise.
+The main configuration must be valid UTF-8 TOML, at most **16 KiB**. Supported sections are `[runtime]`, optional `[telegram]`, `[email]`, `[ingress]`, `[[sources]]`, `[[servers]]` and inline `[[sites]]`. Set `runtime.sites_file` to load website endpoint tables from a separate file instead; each file has its own 16 KiB limit. Server tables belong in the main file. Unknown sections or keys fail validation. Durations accept finite integers or floats; counts require integers, not booleans. All ranges below are inclusive unless stated otherwise.
 
 Native configuration selection, from highest to lowest priority:
 
@@ -27,6 +27,8 @@ The supplied image contains these inventories:
 | [config/ingress.example.toml](../config/ingress.example.toml) | `/app/config/ingress.example.toml` | Push-only source and configured delivery |
 | [config/email.example.toml](../config/email.example.toml) | `/app/config/email.example.toml` | Public websites with production email |
 | [config/email.local.toml](../config/email.local.toml) | `/app/config/email.local.toml` | Synthetic websites with Mailpit incident email |
+| [config/servers.example.toml](../config/servers.example.toml) | `/app/config/servers.example.toml` | Linux Node Exporter through an authenticated HTTPS endpoint |
+| [config/servers.local.toml](../config/servers.local.toml) | `/app/config/servers.local.toml` | Synthetic Linux readings and Mailpit incidents |
 | [config/checks.example.toml](../config/checks.example.toml) | `/app/config/checks.example.toml` | Shared website/Telegram/email endpoint tables; not a standalone main configuration |
 
 Compose selects `/app/config.toml` by default. Set `SENTINEL_CONTAINER_CONFIG` to another **main configuration path in this table**, not the endpoint-only `checks.example.toml`. `compose.monitoring.yaml` explicitly selects `/app/config/demo.toml` instead. Host paths and arbitrary new TOML files are not mounted or copied automatically; a native `--config` can select another readable file, but the supplied Docker packaging includes only the listed examples. Rebuild after editing a packaged configuration or endpoint inventory.
@@ -82,10 +84,10 @@ The endpoint file accepts only repeated `[[sites]]` tables. Do not place `[runti
 | `heartbeat_interval_seconds` | `1.0` | `0.1`–`60`; interval between local heartbeat updates |
 | `health_timeout_seconds` | `5.0` | `0.2`–`300`; must be at least twice `heartbeat_interval_seconds` |
 | `shutdown_timeout_seconds` | `5.0` | `0.1`–`30`; application worker shutdown deadline |
-| `max_concurrency` | `5` | Integer `1`–`5`; shared simultaneous website request limit |
+| `max_concurrency` | `5` | Integer `1`–`5`; shared simultaneous website/exporter request limit |
 | `sites_file` | Omitted | Optional nonempty relative inventory path, at most 2,048 characters, resolved from the main configuration's directory. Absolute paths, `..` segments, backslashes, NUL/control characters and paths/symlinks escaping that directory are rejected. Cannot be combined with inline `[[sites]]`. |
 
-`idle` permits no enabled monitoring inputs and can optionally run Telegram or email alone. `monitor` requires an enabled website or incoming source. `demo` requires an enabled synthetic website, permits only its named origin and rejects enabled live Telegram, Mailchimp email or ingress; local SMTP incident email is allowed. Disabled inventory rows remain subject to structural validation in every mode.
+`idle` permits no enabled monitoring inputs and can optionally run Telegram or email alone. `monitor` requires an enabled website, server or incoming source. `demo` requires an enabled synthetic website or server, permits only named fixture origins and rejects enabled live Telegram, Mailchimp email or ingress; local SMTP incident email is allowed. Disabled inventory rows remain subject to structural validation in every mode; disabled servers do not read token values.
 
 The default Compose shutdown grace period is 15 seconds. If you raise the application shutdown deadline, also allow enough container grace time for cleanup. A larger health timeout changes heartbeat freshness; it does not alter the fixed Telegram worker progress threshold or website progress formula.
 
@@ -139,6 +141,55 @@ Replace the illustrative URL and explicitly enable it only when the endpoint is 
 
 `json_body` may contain JSON objects, arrays, strings, finite numbers and booleans supported by TOML; TOML date/time values and non-finite floats are invalid. The top level must be an object. Serialization sorts object keys, removes optional whitespace and preserves UTF-8 text; the 4,096-byte limit includes the complete serialized body. Content-Type is `application/json` only when a JSON body is present. Omitting the field sends a POST without a JSON body. JSON responses can be checked by literal `marker` text only; there is no JSON-path assertion.
 
+## Linux servers: servers
+
+Configure each explicitly polled Node Exporter endpoint with a `[[servers]]` table in the main file. See [servers.example.toml](../config/servers.example.toml) and the [operating guide](running.md#monitor-linux-servers). No Prometheus server, shell/SSH access or host mount is required by Sentinel. A push-only incoming source cannot share an outbound polling alias; a hybrid source may explicitly combine an enabled website or server with incoming events.
+
+Physical website, server and incoming-source aliases share a **20-source** bound, including disabled rows. Website and server aliases must be distinct. Enabled websites plus expanded server incident rules must total at most **40**. A server always has an exporter-availability rule; enabled CPU, memory and filesystem alerts add one rule each. Setting alert flags to false leaves their readings available as informational data.
+
+| `[[servers]]` key | Default | Accepted value and effect |
+| --- | --- | --- |
+| `alias` | Required | Same 1–32 ASCII identifier format as websites; cannot select a target through Telegram. |
+| `url` | Required | Fixed HTTPS URL, at most 2,048 characters, with any valid port `1`–`65535` and an operator-selected path such as `/metrics`; no credentials, query, fragment, whitespace, controls or backslash. |
+| `token_env` | Required for real endpoints | Uppercase environment variable name matching `[A-Z][A-Z0-9_]{0,127}`. Enabled real sources require a URL-safe 32–128-character value; no token in TOML. Demo fixtures need no token. |
+| `allowed_cidrs` | `[]` | Up to 16 unique canonical IPv4/IPv6 networks for this source's private addresses; public addresses are allowed without a list. Loopback, link-local, multicast, unspecified and reserved targets cannot be enabled through a CIDR. |
+| `poll_interval_seconds` | `30` | Finite `0.1`–`86400`; independent sequential polling, without overlapping or accumulated missed polls. |
+| `connect_timeout_seconds` | `5` | `0.1`–`30`, no greater than the total deadline. |
+| `total_timeout_seconds` | `10` | `0.2`–`120`; includes DNS, transport, response reading and parsing. |
+| `failure_confirmation` | `3` | Integer `1`–`100`; failures/high readings to confirm an incident. |
+| `recovery_confirmation` | `2` | Integer `1`–`100`; successful/low readings to confirm recovery. |
+| `reminder_interval_seconds` | `1800` | `1`–`604800`; requires fresh valid readings and an accepted opening/reminder for that destination. |
+| `cpu_alerts` / `memory_alerts` | `true` | Boolean; `false` collects the reading without creating its resource incident rule. |
+| `cpu_trigger_percent` / `memory_trigger_percent` | `85` | Finite `0`–`100`; at or above this value counts toward DOWN. |
+| `cpu_recovery_percent` / `memory_recovery_percent` | `75` | Finite `0`–`100`, strictly below the corresponding trigger; at or below this value counts toward recovery. |
+| `enabled` | `true` | Boolean; `false` excludes the structurally validated source from polling and reads no token value. |
+
+Each connection validates all DNS answers against that server's address policy. TLS certificate/hostname verification is required. Credentials are sent only to its configured origin; redirects, ambient proxies, cookies, arbitrary headers and compression are not supported. Private HTTP is limited to `metrics-fixture:9100` or `metrics-fixture:9101` in demo mode. Real endpoints require an HTTPS Bearer-auth proxy; Node Exporter's native basic-auth setting alone does not satisfy this contract.
+
+Select at most four exact filesystems per server, with unique mountpoints and aliases:
+
+```toml
+[[servers.filesystems]]
+alias = "root"
+mount = "/"
+trigger_percent = 85
+recovery_percent = 75
+alerts = true
+```
+
+`alias` uses the same bounded identifier format. `mount` is an absolute path, at most 256 characters, without control characters. Threshold ranges and hysteresis match CPU/memory; `alerts = false` keeps this selected filesystem informational. Omitted filesystems are not discovered or alerted automatically. Duplicate/ambiguous series, collector failure, device errors and read-only filesystems yield unknown usage instead of a healthy zero.
+
+| Reading | Meaning |
+| --- | --- |
+| CPU busy | `100 × (1 − idle_delta / total_delta)` over two valid scrapes in the current run; excludes `guest`/`guest_nice`, includes iowait as busy. |
+| Memory used | `100 × (1 − MemAvailable / MemTotal)`; not `MemFree`. |
+| Filesystem capacity unavailable | `100 × (1 − available_bytes / size_bytes)`; includes space reserved from non-root users, not exact occupied bytes. |
+| Uptime | UTC scrape time minus valid boot time; informational, no uptime alert rule. |
+
+CPU requires a matching CPU/mode set, a stable boot time and nondecreasing counters with a positive total delta. Startup, counter reset, changed CPU set, invalid scrape or gap beyond freshness discards the baseline and warms up again. Missing/invalid/NaN/infinite values and failed required collectors remain unknown; one unknown reading does not hide another valid reading from the scrape. Responses are bounded to 1 MiB, 10,000 samples, 512 families, 16 KiB per line, eight labels per sample and 256 CPUs. Only normalized selected readings are persisted; raw exposition, devices, URLs and credentials are excluded from status/notifications.
+
+Exporter availability and each enabled resource rule have separate confirmed state and incident IDs. A valid response can leave individual readings unknown. Only new distinct readings advance confirmations. Values between trigger and recovery retain confirmed state and clear a pending transition count; unknown data also clears that count and cannot open or resolve an incident. Existing resource incidents remain visible with unknown/stale current data and produce no reminders until fresh valid readings resume. Initial healthy observations create no RECOVERY. Freshness is `2 × poll interval + total deadline`; local worker health is independent of the monitored server's availability.
+
 ## Telegram
 
 The only TOML key in `[telegram]` is `enabled`, a boolean defaulting to `false`. Omit the table to leave Telegram disabled. Credentials are validated and workers start only when enabled. For Telegram without website polling, a complete inventory is:
@@ -171,7 +222,7 @@ Use the exact identifier returned for the intended chat by trusted Telegram tool
 
 Channel posting permission is Telegram's [`can_post_messages` administrator right](https://core.telegram.org/bots/api#chatadministratorrights). A numeric user allowlist is still required by Sentinel when the selected destination is a channel. The current single-destination setting does not provide a second private chat for channel commands.
 
-Without a configured topic, group commands are accepted throughout the configured chat and replies stay in the incoming topic; incident alerts use the chat without a topic. With a topic configured, commands and alerts use that exact topic. Commands from other chats/users/topics, bots, anonymous senders, edited messages and channel posts are ignored. `/help`, `/status`, `/sites`, `/servers` and `/server <alias>` read cached data; server commands currently report no configured server sources.
+Without a configured topic, group commands are accepted throughout the configured chat and replies stay in the incoming topic; incident alerts use the chat without a topic. With a topic configured, commands and alerts use that exact topic. Commands from other chats/users/topics, bots, anonymous senders, edited messages and channel posts are ignored. `/help`, `/status`, `/sites`, `/servers` and `/server <alias>` read cached data. Server commands expose configured aliases, exporter availability, freshness, resource readings and confirmed incidents without making requests.
 
 Only one poller may use a bot token. Existing webhooks are refused, never deleted automatically. `check-config` validates local values without contacting Telegram. Starting the application validates the bot and delivers eligible queued incidents; it does not send an automatic greeting or test message. The production API origin is fixed to verified `https://api.telegram.org` and cannot be replaced through configuration.
 
@@ -232,7 +283,7 @@ See [`config/ingress.example.toml`](../config/ingress.example.toml) for a comple
 | `retention_seconds` | `172800` | `172800`–`1209600`; at least age plus future skew, for receipts and terminal occurrences. |
 | `max_receipts` / `max_receipts_per_source` | `10000` / `1000` | Positive integers up to these defaults; retained duplicate identities. |
 | `max_tombstones` / `max_tombstones_per_source` | `10000` / `1000` | Positive integers up to these defaults; retained terminal occurrence identities. |
-| `max_pending` / `max_pending_per_source` | `1000` / `200` | Positive integers up to these defaults; incoming delivery budget, separate from 80 website slots. |
+| `max_pending` / `max_pending_per_source` | `1000` / `200` | Positive integers up to these defaults; incoming delivery budget, separate from 80 polled website/server slots. |
 | `max_active_incidents` / `max_active_incidents_per_source` | `200` / `50` | Positive integers up to these defaults; active pushed occurrences. |
 
 Per-source rates, bursts and capacities cannot exceed their global equivalents. Pending budgets must cover opening plus resolution for every configured active occurrence; receipt/tombstone budgets must also cover lifecycle reservations. Lowering limits does not erase accepted state. An already accepted active occurrence retains its matching resolution capacity; new admissions fail when they would spend protected slots. Protected receipts/tombstones are not pruned before retention to admit more events. Rate checks still apply to duplicate requests.
@@ -240,12 +291,12 @@ Per-source rates, bursts and capacities cannot exceed their global equivalents. 
 | `[[sources]]` key | Required/default | Meaning |
 | --- | --- | --- |
 | `alias` | Required | Same 1–32-character identifier rules as website aliases. |
-| `mode` | `"push"` | `"push"` has no target; `"hybrid"` requires an explicit enabled website with the same alias. |
+| `mode` | `"push"` | `"push"` has no target; `"hybrid"` requires an explicit enabled website or server with the same alias. |
 | `allowed_types` | Required | 1–20 unique lowercase identifiers matching `[a-z][a-z0-9_.-]{0,63}`. |
 | `token_env` | Required | Distinct uppercase environment name, at most 128 characters; value stays outside TOML. |
 | `enabled` | `true` | Boolean; disabled sources cannot authenticate. |
 
-At most 20 distinct configured source aliases are allowed across sites and incoming sources, including disabled entries. A push-only alias cannot collide with a website; a hybrid alias explicitly combines both inputs. Source entries cannot define URLs, ports, credentials for outbound access or recipients. Tokens are distinct URL-safe ASCII strings of 32–128 characters, read only for enabled receiver sources, and excluded from repr, logs, status and persistence. Rotate them through environment/recreation. `compose.ingress.yaml` forwards only the example's `SENTINEL_SOURCE_APP_TOKEN`; explicitly add forwarding for each additional source credential.
+At most 20 distinct configured source aliases are allowed across sites, servers and incoming sources, including disabled entries. A push-only alias cannot collide with a website or server; a hybrid alias explicitly combines an enabled polled input with events. Source entries cannot define URLs, ports, credentials for outbound access or recipients. Tokens are distinct URL-safe ASCII strings of 32–128 characters, read only for enabled receiver sources, and excluded from repr, logs, status and persistence. Rotate them through environment/recreation. `compose.ingress.yaml` forwards only the example's `SENTINEL_SOURCE_APP_TOKEN`; explicitly add forwarding for each additional source credential.
 
 ## Environment scopes
 
@@ -255,7 +306,8 @@ At most 20 distinct configured source aliases are allowed across sites and incom
 | `SENTINEL_STATE_DIR` | Overrides TOML `runtime.state_dir` | Fixed to `/var/lib/sentinel` on the named state volume; the host `.env` value does not override it |
 | `SENTINEL_CONTAINER_CONFIG` | Not used by the Python application | Selects a baked inventory; default `/app/config.toml`; the monitoring override explicitly selects demo configuration |
 | `SENTINEL_TELEGRAM_*` above | Must be exported into the process environment | Explicitly interpolated from the shell or `.env`; absent values become empty |
-| `SENTINEL_EMAIL_*` above | Must be exported into the process environment | Explicitly interpolated from the shell or `.env`; the offline email override supplies fixed synthetic addresses |
+| `SENTINEL_EMAIL_*` above | Must be exported into the process environment | Explicitly interpolated from the shell or `.env`; offline email/metrics overrides supply fixed synthetic addresses |
+| `SENTINEL_SERVER_NODE_TOKEN` | Value of the example server's `token_env`; exported only for enabled real polling | Forwarded explicitly by the base file; extra token names require extra Compose forwarding |
 | `MAILPIT_HTTP_PORT` | Not used by the Python application | Mailpit loopback UI host port, default `8025`; normally `1`–`65535`, with `0` requesting automatic Docker allocation; relevant only with the local override |
 | `COMPOSE_PROJECT_NAME` | Not used by the Python application | Compose project/container/network/volume namespace; `docker compose -p NAME` selects it explicitly |
 
@@ -282,9 +334,9 @@ The following application limits are not configurable TOML or environment fields
 
 | Area | Current behavior |
 | --- | --- |
-| Inventory/file bounds | 20 site rows, 16 KiB per main/inventory file, 32-character aliases, 4,096-byte POST JSON body; upper limits cannot be raised through config |
+| Inventory/file bounds | 20 physical aliases, at most 40 expanded polled rules, four filesystems/server, 16 KiB per main/inventory file, 32-character physical aliases, 4,096-byte POST JSON body; upper limits cannot be raised through config |
 | Website redirects | GET: at most 3, same origin only. POST: no redirect follow/replay. |
-| Durable delivery queue | Telegram: 80 website plus at most 1,000 incoming pending records. Email: the same separate budgets per recipient, at most 5,400 total; admission failure rolls back the observation/event and all its channel records. In-flight bounds are Telegram 20 and email 5. |
+| Durable delivery queue | Telegram: 80 polled website/server plus at most 1,000 incoming pending records. Email: the same separate budgets per recipient, at most 5,400 total; admission failure rolls back the observation/event and all its channel records. In-flight bounds are Telegram 20 and email 5. |
 | History | At most 200 terminal records per channel and 200 incident-audit records; not a complete outage archive |
 | Telegram send pacing | One FIFO sender; at least 3.1 seconds between incident/reply send starts |
 | Incident attempts | At most 8 per destination; backoff with jitter capped at 300 seconds unless the provider requires longer |
@@ -306,7 +358,7 @@ For each destination, DOWN must be accepted before its matching RECOVERY. Email 
 
 ## Applying changes
 
-Startup atomically upgrades supported schema-1/2/3/4 state to schema 5, preserving startup metadata, website incidents, incoming receipts and Telegram delivery history. Older application versions cannot open schema-5 state. Status/config validation does not initialize or migrate a stopped database; start the matching application first.
+Startup atomically upgrades supported schema-1/2/3/4/5 state to schema 6, preserving startup metadata, website incidents, incoming receipts and Telegram/email delivery history. Schema 6 stores normalized server snapshots and independent exporter/resource rule state. Older application versions cannot open schema-6 state. Status/config validation does not initialize or migrate a stopped database; start the matching application first.
 
 Configuration is loaded at process startup; there is no hot reload.
 
@@ -319,6 +371,9 @@ Configuration is loaded at process startup; there is no hot reload.
 | Site URL, HTTP method, JSON body, marker, accepted status range, either confirmation count, body limit or either request timeout | Apply the inventory change as above | Resets that site's confirmed state to UNKNOWN, cancels obsolete never-attempted records and does not invent RECOVERY; attempted/in-flight outcomes remain protected |
 | Poll/reminder interval | Apply the inventory change | Preserves confirmed incident identity; restart begins fresh scheduling/reminder deadlines |
 | Site disabled/removed or alias renamed | Apply the inventory change | Removes the old active source state and obsolete never-attempted records; a new alias starts as a new source |
+| Server URL, address policy, request timeouts or selected filesystem inventory changed | Apply the inventory change | Invalidates its cached server snapshot; affected rule semantics reset without a fabricated recovery, while protected attempted deliveries remain durable |
+| Resource threshold, alert flag, selected mount or confirmation counts changed | Apply the inventory change | Resets only affected rule identities; unchanged rules retain confirmed incidents. No historical alert/recovery is invented for a new rule. |
+| Server token rotated | Apply environment and recreate | Preserves source/rule identity and accepted delivery history; credentials are absent from fingerprints and persistence |
 | Telegram first enabled | Apply TOML and environment | Binds never-attempted logical-operator records to the configured destination without pretending they were already sent |
 | Telegram disabled | Apply TOML | Stops its workers and pauses bound records |
 | Telegram chat/topic changed | Apply environment | Old pending records fail with `destination_changed`; old incidents/history are not forwarded to the new destination |

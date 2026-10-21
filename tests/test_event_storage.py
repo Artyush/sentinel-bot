@@ -411,11 +411,12 @@ def test_migration_from_schema_three_preserves_metadata_websites_and_delivery(
             "email_site_routes",
             "email_push_routes",
             "email_progress",
+            "server_snapshots",
         ):
             connection.execute(f"DROP TABLE {table}")
         connection.execute("PRAGMA user_version = 3")
     metadata = initialize_state(store.database.parent, NOW + timedelta(seconds=1))
-    assert metadata.schema_version == 5
+    assert metadata.schema_version == 6
     assert metadata.startup_count == 2
     reopened = SQLiteStore(store.database.parent)
     assert reopened.pending_notifications() == (record,)
@@ -490,6 +491,7 @@ def test_failed_schema_three_ddl_upgrade_rolls_back_all_new_state(
             "email_site_routes",
             "email_push_routes",
             "email_progress",
+            "server_snapshots",
         ):
             connection.execute(f"DROP TABLE {table}")
         connection.execute("PRAGMA user_version = 3")

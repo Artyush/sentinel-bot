@@ -3,6 +3,7 @@
 import time
 
 from sentinel_bot.config import Settings
+from sentinel_bot.metric_models import MetricValues
 from sentinel_bot.policy import is_fresh
 from sentinel_bot.runtime import observation_progress
 from sentinel_bot.storage import SQLiteStore
@@ -68,9 +69,61 @@ def status_snapshot(settings: Settings) -> dict[str, object]:
                 },
             }
         )
+    snapshots = {record.alias: record for record in store.read_server_snapshots()}
+    servers: list[dict[str, object]] = []
+    for server in settings.servers:
+        cached = snapshots.get(server.alias)
+        snapshot = (
+            None if cached is None or cached.fingerprint != server.fingerprint else cached.snapshot
+        )
+        values = MetricValues() if snapshot is None else snapshot.values
+        current_values = {
+            f"{server.alias}/cpu": values.cpu_percent,
+            f"{server.alias}/memory": values.memory_percent,
+            **{f"{server.alias}/fs_{item.alias}": item.value for item in values.filesystems},
+        }
+        rule_rows: list[dict[str, object]] = []
+        for rule in server.rules:
+            record = records.get(rule.alias)
+            matching = record is not None and record.fingerprint == rule.fingerprint
+            state = record.state if matching and record is not None else None
+            rule_rows.append(
+                {
+                    "name": rule.alias.split("/", 1)[1],
+                    "state": "UNKNOWN" if state is None else state.confirmed.value,
+                    "fresh": matching
+                    and (rule.trigger is None or current_values.get(rule.alias) is not None)
+                    and is_fresh(progress.get(rule.alias), now, rule.freshness_limit),
+                    "incident_id": None if state is None else state.incident_id,
+                }
+            )
+        availability = next(
+            (row["state"] for row in rule_rows if row["name"] == "exporter"), "UNKNOWN"
+        )
+        servers.append(
+            {
+                "alias": server.alias,
+                "availability": availability,
+                "fresh": snapshot is not None
+                and is_fresh(progress.get(server.alias), now, server.freshness_limit),
+                "checked_at": None if snapshot is None else snapshot.checked_at.isoformat(),
+                "error": None
+                if snapshot is None or snapshot.result.error is None
+                else snapshot.result.error.value,
+                "cpu_percent": values.cpu_percent,
+                "memory_percent": values.memory_percent,
+                "uptime_seconds": values.uptime_seconds,
+                "filesystems": [
+                    {"alias": item.alias, "used_percent": item.value, "error": item.error}
+                    for item in values.filesystems
+                ],
+                "rules": rule_rows,
+            }
+        )
     return {
         "mode": settings.mode,
         "sites": sites,
+        "servers": servers,
         "pending_notifications": store.pending_count(),
         "telegram": {"enabled": settings.telegram is not None, **store.delivery_status()},
         "email": email,

@@ -22,6 +22,7 @@ class ErrorKind(StrEnum):
     ADDRESS_POLICY = "address_policy"
     REDIRECT = "redirect"
     BODY_LIMIT = "body_limit"
+    METRICS = "metrics"
 
 
 @dataclass(frozen=True)

@@ -2,6 +2,8 @@
 
 Sentinel accepts technical events from configured servers and services, persists them and queues notifications for every enabled channel and configured destination. Detection belongs to the sender. A push-only source needs no outbound probe from Sentinel.
 
+Linux metrics are collected separately from explicitly configured Node Exporter endpoints. This event route accepts notifications and incident lifecycle reports, not raw metric measurements. A hybrid alias may combine an explicitly polled website or server with incoming events; sender-reported state does not set polling availability or resource readings. See [server configuration](configuration.md#linux-servers-servers).
+
 **`POST /api/v1/events`** — submit one notification or incident lifecycle event.
 
 Use your HTTPS reverse proxy as the base URL. The receiver is optional; enable it using the [running guide](running.md#receive-events-from-servers). Poll-only operation has no HTTP listener. The [OpenAPI specification](openapi.yaml) can be imported into Postman or opened in a compatible Swagger viewer; it is a static file, not a public `/docs` endpoint.

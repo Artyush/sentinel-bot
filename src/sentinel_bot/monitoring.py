@@ -84,12 +84,15 @@ async def monitor_sites(
     progress: MonitoringProgress,
     *,
     state_lock: asyncio.Lock | None = None,
+    request_slots: asyncio.Semaphore | None = None,
 ) -> None:
     """Supervise all configured sites after startup has reconciled their state."""
     store = SQLiteStore(settings.state_dir)
     state_lock = asyncio.Lock() if state_lock is None else state_lock
     fixture_hosts = frozenset({"site-fixture"}) if settings.mode == "demo" else frozenset()
-    async with HttpChecker(settings.max_concurrency, fixture_hosts) as checker:
+    async with HttpChecker(
+        settings.max_concurrency, fixture_hosts, semaphore=request_slots
+    ) as checker:
         async with asyncio.TaskGroup() as group:
             tasks = [
                 group.create_task(

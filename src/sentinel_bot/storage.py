@@ -22,6 +22,12 @@ from sentinel_bot.events import (
     decide_event,
     validate_event_time,
 )
+from sentinel_bot.metric_models import (
+    FilesystemReading,
+    IncidentRule,
+    MetricValues,
+    ServerSnapshot,
+)
 from sentinel_bot.models import (
     CheckResult,
     ErrorKind,
@@ -34,7 +40,7 @@ from sentinel_bot.models import (
 from sentinel_bot.policy import apply_observation as decide_observation
 from sentinel_bot.policy import due_reminder
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DATABASE_NAME = "state.sqlite3"
 HISTORY_LIMIT = 200
 MAX_PENDING_NOTIFICATIONS = 80
@@ -145,7 +151,7 @@ def _upgrade_schema(connection: sqlite3.Connection) -> None:
                 startup_count INTEGER NOT NULL CHECK (startup_count > 0)
             )"""
         )
-    elif version not in (1, 2, 3, 4, SCHEMA_VERSION):
+    elif version not in (1, 2, 3, 4, 5, SCHEMA_VERSION):
         raise StorageError(f"Unsupported state schema version {version}; expected {SCHEMA_VERSION}")
     if version == 1:
         row = connection.execute(
@@ -162,6 +168,14 @@ def _upgrade_schema(connection: sqlite3.Connection) -> None:
         _create_ingress_schema(connection)
     if version < 5:
         _create_email_schema(connection)
+    if version < 6:
+        connection.execute(
+            """CREATE TABLE server_snapshots (
+                alias TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                snapshot TEXT
+            )"""
+        )
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     for query in (
         "SELECT alias, fingerprint, state, observation, delivery_destination, opening_id, "
@@ -192,6 +206,7 @@ def _upgrade_schema(connection: sqlite3.Connection) -> None:
         "FROM email_progress LIMIT 0",
         "SELECT singleton, pause_until, pause_delay_seconds, last_error, suspended "
         "FROM email_channel LIMIT 0",
+        "SELECT alias, fingerprint, snapshot FROM server_snapshots LIMIT 0",
     ):
         connection.execute(query)
     if connection.execute("SELECT 1 FROM telegram_route WHERE singleton = 1").fetchone() is None:
@@ -392,6 +407,13 @@ class SiteRecord:
 
 
 @dataclass(frozen=True)
+class ServerRecord:
+    alias: str
+    fingerprint: str
+    snapshot: ServerSnapshot | None
+
+
+@dataclass(frozen=True)
 class OutboxRecord:
     id: str
     event: Event
@@ -450,6 +472,20 @@ def _encode_observation(observation: Observation) -> str:
         },
         separators=(",", ":"),
     )
+
+
+def _encode_server_snapshot(snapshot: ServerSnapshot) -> str:
+    document = _document(_encode_observation(Observation(snapshot.checked_at, snapshot.result)))
+    document["values"] = {
+        "cpu_percent": snapshot.values.cpu_percent,
+        "memory_percent": snapshot.values.memory_percent,
+        "uptime_seconds": snapshot.values.uptime_seconds,
+        "filesystems": [
+            {"alias": reading.alias, "value": reading.value, "error": reading.error}
+            for reading in snapshot.values.filesystems
+        ],
+    }
+    return json.dumps(document, separators=(",", ":"), allow_nan=False)
 
 
 def _encode_event(event: Event) -> str:
@@ -531,6 +567,54 @@ def _decode_observation(raw: str) -> Observation:
             latency,
         ),
     )
+
+
+def _optional_number(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        raise ValueError("Stored metric must be finite and numeric")
+    return float(value)
+
+
+def _decode_server_snapshot(raw: str) -> ServerSnapshot:
+    data = _document(raw)
+    values = data["values"]
+    if not isinstance(values, dict) or not isinstance(values.get("filesystems"), list):
+        raise ValueError("Stored server values are invalid")
+    filesystems = []
+    for reading in values["filesystems"]:
+        if not isinstance(reading, dict):
+            raise ValueError("Stored filesystem reading is invalid")
+        filesystems.append(
+            FilesystemReading(
+                _text(reading["alias"]),
+                _optional_number(reading["value"]),
+                None if reading["error"] is None else _text(reading["error"]),
+            )
+        )
+    observation = _decode_observation(raw)
+    return ServerSnapshot(
+        observation.checked_at,
+        observation.result,
+        MetricValues(
+            _optional_number(values["cpu_percent"]),
+            _optional_number(values["memory_percent"]),
+            _optional_number(values["uptime_seconds"]),
+            tuple(filesystems),
+        ),
+    )
+
+
+def _server_record(row: sqlite3.Row) -> ServerRecord:
+    try:
+        return ServerRecord(
+            row["alias"],
+            row["fingerprint"],
+            None if row["snapshot"] is None else _decode_server_snapshot(row["snapshot"]),
+        )
+    except (ValueError, KeyError, TypeError) as exc:
+        raise StorageError("Stored server snapshot is invalid") from exc
 
 
 def _decode_event(raw: str) -> Event:
@@ -642,7 +726,7 @@ class SQLiteStore:
                 )
             yield connection
 
-    def reconcile(self, sites: Sequence[SiteConfig]) -> None:
+    def reconcile(self, sites: Sequence[SiteConfig | IncidentRule], *, max_rules: int = 20) -> None:
         """Reset changed sources and stale confirmations without fake recovery.
 
         Call once at startup, after acquiring state ownership. Confirmed state,
@@ -651,8 +735,10 @@ class SQLiteStore:
         """
         enabled = tuple(site for site in sites if site.enabled)
         aliases = tuple(site.alias for site in enabled)
-        if len(aliases) > 20 or len(aliases) != len(set(aliases)):
-            raise ValueError("Source inventory requires at most 20 unique aliases")
+        if max_rules not in (20, 40):
+            raise ValueError("Polled rule limit must be 20 or 40")
+        if len(aliases) > max_rules or len(aliases) != len(set(aliases)):
+            raise ValueError(f"Source inventory requires at most {max_rules} unique aliases")
         with self._transaction() as connection:
             existing = {
                 row["alias"]: _site_record(row)
@@ -676,6 +762,40 @@ class SQLiteStore:
                     )
                 else:
                     self._reset_pending(connection, previous)
+
+    def reconcile_servers(self, servers: Sequence[tuple[str, str]]) -> None:
+        """Bound latest telemetry to the configured inventory without altering incidents."""
+        aliases = tuple(alias for alias, _ in servers)
+        if len(aliases) > 20 or len(aliases) != len(set(aliases)):
+            raise ValueError("Server inventory requires at most 20 unique aliases")
+        with self._transaction() as connection:
+            for row in connection.execute("SELECT alias FROM server_snapshots").fetchall():
+                if row[0] not in aliases:
+                    connection.execute("DELETE FROM server_snapshots WHERE alias = ?", (row[0],))
+            for alias, fingerprint in servers:
+                connection.execute(
+                    """INSERT INTO server_snapshots (alias, fingerprint, snapshot)
+                    VALUES (?, ?, NULL) ON CONFLICT(alias) DO UPDATE SET
+                    fingerprint = excluded.fingerprint, snapshot = NULL
+                    WHERE server_snapshots.fingerprint != excluded.fingerprint""",
+                    (alias, fingerprint),
+                )
+
+    def read_server_snapshot(self, alias: str) -> ServerRecord | None:
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM server_snapshots WHERE alias = ?", (alias,)
+            ).fetchone()
+            return None if row is None else _server_record(row)
+
+    def read_server_snapshots(self) -> tuple[ServerRecord, ...]:
+        with self._transaction() as connection:
+            return tuple(
+                _server_record(row)
+                for row in connection.execute(
+                    "SELECT * FROM server_snapshots ORDER BY alias"
+                ).fetchall()
+            )
 
     @staticmethod
     def _cancel_unsent(connection: sqlite3.Connection, alias: str) -> None:
@@ -727,38 +847,99 @@ class SQLiteStore:
                 for row in connection.execute("SELECT * FROM sites ORDER BY alias").fetchall()
             )
 
-    def apply_observation(self, site: SiteConfig, observation: Observation) -> SiteRecord:
+    def apply_observation(
+        self, site: SiteConfig | IncidentRule, observation: Observation
+    ) -> SiteRecord:
         """Commit a fresh reading, policy transition, and outbox atomically."""
         with self._transaction() as connection:
-            record = self._read_site(connection, site.alias)
-            if record.fingerprint != site.fingerprint or not site.enabled:
+            return self._apply_observation(connection, site, observation)
+
+    def apply_server_observation(
+        self,
+        alias: str,
+        fingerprint: str,
+        snapshot: ServerSnapshot,
+        rules: Sequence[IncidentRule],
+        observations: Sequence[Observation | None],
+    ) -> tuple[SiteRecord, ...]:
+        """Commit one scrape and all its rule transitions and destinations together.
+
+        Unknown readings and values inside a hysteresis band clear pending
+        confirmations without changing a confirmed incident or inventing recovery.
+        """
+        if len(rules) != len(observations) or len({rule.alias for rule in rules}) != len(rules):
+            raise ValueError("Each server rule requires exactly one distinct observation")
+        if any(not rule.alias.startswith(f"{alias}/") for rule in rules):
+            raise ValueError("Server rules must belong to their configured source")
+        if any(
+            observation is not None and observation.checked_at != snapshot.checked_at
+            for observation in observations
+        ):
+            raise ValueError("Server rule observations must share the scrape timestamp")
+        encoded = _encode_server_snapshot(snapshot)
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM server_snapshots WHERE alias = ?", (alias,)
+            ).fetchone()
+            if row is None or row["fingerprint"] != fingerprint:
+                raise StorageError("Server configuration was not reconciled")
+            previous = tuple(self._read_site(connection, rule.alias) for rule in rules)
+            if any(
+                record.fingerprint != rule.fingerprint or not rule.enabled
+                for rule, record in zip(rules, previous, strict=True)
+            ):
                 raise StorageError("Source configuration was not reconciled")
-            if record.observation == observation:
-                return record
-            transition = decide_observation(
-                site.alias,
-                site.fingerprint,
-                record.state,
-                observation,
-                failure_confirmation=site.failure_confirmation,
-                recovery_confirmation=site.recovery_confirmation,
+            if row["snapshot"] == encoded:
+                return previous
+            records = tuple(
+                self._apply_observation(connection, rule, observation)
+                for rule, observation in zip(rules, observations, strict=True)
             )
             connection.execute(
-                "UPDATE sites SET state = ?, observation = ? WHERE alias = ?",
-                (_encode_state(transition.state), _encode_observation(observation), site.alias),
+                "UPDATE server_snapshots SET snapshot = ? WHERE alias = ?",
+                (encoded, alias),
             )
-            if transition.event is not None:
-                self._queue_event(connection, site.alias, transition.event)
-                connection.execute(
-                    "INSERT INTO incident_audit (source_alias, event) VALUES (?, ?)",
-                    (site.alias, _encode_event(transition.event)),
-                )
-                connection.execute(
-                    """DELETE FROM incident_audit WHERE sequence NOT IN
-                    (SELECT sequence FROM incident_audit ORDER BY sequence DESC LIMIT ?)""",
-                    (HISTORY_LIMIT,),
-                )
-            return SiteRecord(site.alias, site.fingerprint, transition.state, observation)
+            return records
+
+    @staticmethod
+    def _apply_observation(
+        connection: sqlite3.Connection,
+        site: SiteConfig | IncidentRule,
+        observation: Observation | None,
+    ) -> SiteRecord:
+        record = SQLiteStore._read_site(connection, site.alias)
+        if record.fingerprint != site.fingerprint or not site.enabled:
+            raise StorageError("Source configuration was not reconciled")
+        if observation is None:
+            SQLiteStore._reset_pending(connection, record)
+            connection.execute("UPDATE sites SET observation = NULL WHERE alias = ?", (site.alias,))
+            return SQLiteStore._read_site(connection, site.alias)
+        if record.observation == observation:
+            return record
+        transition = decide_observation(
+            site.alias,
+            site.fingerprint,
+            record.state,
+            observation,
+            failure_confirmation=site.failure_confirmation,
+            recovery_confirmation=site.recovery_confirmation,
+        )
+        connection.execute(
+            "UPDATE sites SET state = ?, observation = ? WHERE alias = ?",
+            (_encode_state(transition.state), _encode_observation(observation), site.alias),
+        )
+        if transition.event is not None:
+            SQLiteStore._queue_event(connection, site.alias, transition.event)
+            connection.execute(
+                "INSERT INTO incident_audit (source_alias, event) VALUES (?, ?)",
+                (site.alias, _encode_event(transition.event)),
+            )
+            connection.execute(
+                """DELETE FROM incident_audit WHERE sequence NOT IN
+                (SELECT sequence FROM incident_audit ORDER BY sequence DESC LIMIT ?)""",
+                (HISTORY_LIMIT,),
+            )
+        return SiteRecord(site.alias, site.fingerprint, transition.state, observation)
 
     @staticmethod
     def _queue_event(connection: sqlite3.Connection, alias: str, event: Event) -> None:
@@ -1654,7 +1835,12 @@ class SQLiteStore:
             )
 
     def queue_reminder(
-        self, site: SiteConfig, now: datetime, fresh: bool, *, due: bool | None = None
+        self,
+        site: SiteConfig | IncidentRule,
+        now: datetime,
+        fresh: bool,
+        *,
+        due: bool | None = None,
     ) -> bool:
         """Queue at most one reminder after this route's accepted DOWN/reminder."""
         with self._transaction() as connection:
@@ -2181,7 +2367,7 @@ class SQLiteStore:
 
     def queue_email_reminder(
         self,
-        site: SiteConfig,
+        site: SiteConfig | IncidentRule,
         destination: str,
         now: datetime,
         fresh: bool,

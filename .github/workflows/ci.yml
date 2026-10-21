@@ -42,3 +42,5 @@ jobs:
         run: python scripts/ingress_smoke.py
       - name: Docker email smoke check
         run: python scripts/email_smoke.py
+      - name: Docker Linux metrics smoke check
+        run: python scripts/metrics_smoke.py

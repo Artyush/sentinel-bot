@@ -94,7 +94,7 @@ def reserve(store: SQLiteStore, destination: str, seconds: int = 0) -> OutboxRec
 
 def downgrade_four(store: SQLiteStore) -> None:
     with closing(sqlite3.connect(store.database)) as connection, connection:
-        for table in EMAIL_TABLES:
+        for table in (*EMAIL_TABLES, "server_snapshots"):
             connection.execute(f"DROP TABLE {table}")
         connection.execute("PRAGMA user_version = 4")
 
@@ -111,7 +111,7 @@ def test_schema_four_upgrade_preserves_existing_channel_events_and_metadata(
         incidents = connection.execute("SELECT * FROM pushed_incidents").fetchall()
     downgrade_four(store)
     metadata = initialize_state(store.database.parent, NOW + timedelta(days=1))
-    assert metadata.schema_version == 5
+    assert metadata.schema_version == 6
     assert metadata.startup_count == 2
     assert metadata.first_started_at == NOW.isoformat()
     assert store.pending_notifications() == before

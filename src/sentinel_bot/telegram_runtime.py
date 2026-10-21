@@ -325,7 +325,7 @@ async def _deliver(
     config = settings.telegram
     assert config is not None
     retries: dict[str, float] = {}
-    sites = {site.alias: site for site in settings.sites}
+    sites = {site.alias: site for site in settings.polled_rules}
     while not stopped.is_set():
         progress.telegram["delivery"] = time.monotonic()
         pending = await _state(lock, store.pending_notifications)
@@ -435,7 +435,7 @@ async def _reminder_worker(
 ) -> None:
     config = settings.telegram
     assert config is not None
-    sites = {site.alias: site for site in settings.sites}
+    sites = {site.alias: site for site in settings.polled_rules}
     while not stopped.is_set():
         progress.telegram["reminders"] = time.monotonic()
         records = await _state(lock, store.reminder_progress)

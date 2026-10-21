@@ -235,10 +235,32 @@ def render_command(command: Command, snapshot: Mapping[str, object], *, now: dat
     """Render cached status; command arguments never become targets or reply text."""
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("Rendering time must be timezone-aware")
-    if command.name == "servers":
-        return "No server sources configured."
-    if command.name == "server":
-        return "No server sources configured. Use /servers to list configured aliases."
+    if command.name in {"server", "servers"}:
+        raw_servers = snapshot.get("servers")
+        servers = (
+            []
+            if not isinstance(raw_servers, (list, tuple))
+            else [
+                _mapping(item)
+                for item in raw_servers[:MAX_SITES]
+                if isinstance(_mapping(item).get("alias"), str)
+                and _ALIAS.fullmatch(str(_mapping(item)["alias"])) is not None
+            ]
+        )
+        if not servers:
+            return (
+                "No server sources configured."
+                if command.name == "servers"
+                else "No server sources configured. Use /servers to list configured aliases."
+            )
+        if command.name == "server":
+            servers = [server for server in servers if server.get("alias") == command.alias]
+            if not servers:
+                return "Unknown server alias. Use /servers to list configured aliases."
+        lines = ["Configured servers", f"Snapshot time (UTC): {now.astimezone(UTC).isoformat()}"]
+        for server in servers:
+            lines.extend(_server_lines(server))
+        return bound_text("\n".join(lines))
     if command.name not in ("status", "sites"):
         return _HELP
     title = "Sentinel status" if command.name == "status" else "Configured websites"
@@ -293,6 +315,13 @@ def render_command(command: Command, snapshot: Mapping[str, object], *, now: dat
     else:
         lines.append("No website sources configured.")
     if command.name == "status":
+        status_servers = snapshot.get("servers")
+        if isinstance(status_servers, (list, tuple)):
+            for value in status_servers[:MAX_SITES]:
+                server = _mapping(value)
+                alias = server.get("alias")
+                if isinstance(alias, str) and _ALIAS.fullmatch(alias):
+                    lines.extend(_server_lines(server))
         sources = snapshot.get("sources")
         if isinstance(sources, (list, tuple)):
             for value in sources[:MAX_SITES]:
@@ -307,3 +336,42 @@ def render_command(command: Command, snapshot: Mapping[str, object], *, now: dat
                     f"event age={_age(source.get('last_event_at'), now)}"
                 )
     return bound_text("\n".join(lines))
+
+
+def _metric_text(value: object, suffix: str = "%") -> str:
+    if type(value) not in (int, float) or not isinstance(value, (int, float)):
+        return "UNKNOWN"
+    return f"{value:.1f}{suffix}" if math.isfinite(value) and value >= 0 else "UNKNOWN"
+
+
+def _server_lines(server: Mapping[str, object]) -> list[str]:
+    state = server.get("availability")
+    if not isinstance(state, str) or state not in {"UNKNOWN", "UP", "DOWN"}:
+        state = "UNKNOWN"
+    freshness = "fresh" if server.get("fresh") is True else "stale"
+    lines = [
+        f"Server {server['alias']}: exporter={state}; {freshness}",
+        f"CPU={_metric_text(server.get('cpu_percent'))}; RAM={_metric_text(server.get('memory_percent'))}; "
+        f"uptime={_metric_text(server.get('uptime_seconds'), 's')}",
+    ]
+    filesystems = server.get("filesystems")
+    if isinstance(filesystems, (list, tuple)):
+        for raw in filesystems[:4]:
+            item = _mapping(raw)
+            alias = item.get("alias")
+            if isinstance(alias, str) and _ALIAS.fullmatch(alias):
+                lines.append(
+                    f"Filesystem {alias}: unavailable capacity={_metric_text(item.get('used_percent'))}"
+                )
+    rules = server.get("rules")
+    if isinstance(rules, (list, tuple)):
+        for raw in rules[:7]:
+            rule = _mapping(raw)
+            name = rule.get("name")
+            if isinstance(name, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,35}", name):
+                state = rule.get("state")
+                if isinstance(state, str) and state in {"UNKNOWN", "UP", "DOWN"}:
+                    lines.append(
+                        f"Rule {name}: {state}; {'fresh' if rule.get('fresh') is True else 'stale'}"
+                    )
+    return lines

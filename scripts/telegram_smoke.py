@@ -34,6 +34,7 @@ def main() -> None:
                 "SENTINEL_EMAIL_FROM": "",
                 "SENTINEL_EMAIL_RECIPIENTS": "",
                 "SENTINEL_SOURCE_APP_TOKEN": "",
+                "SENTINEL_SERVER_NODE_TOKEN": "",
             }
             result = subprocess.run(
                 [

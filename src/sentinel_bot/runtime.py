@@ -21,7 +21,7 @@ from sentinel_bot.workers import run_blocking as _blocking
 
 LOCK_NAME = "instance.lock"
 HEALTH_NAME = "health.json"
-MAX_HEALTH_BYTES = 4096
+MAX_HEALTH_BYTES = 8192
 
 
 class InstanceError(RuntimeError):
@@ -149,9 +149,15 @@ async def run(settings: Settings) -> None:
                     datetime.now(UTC),
                 )
             )
-            await _blocking(lambda: store.reconcile(settings.sites))
+            await _blocking(lambda: store.reconcile(settings.polled_rules, max_rules=40))
+            await _blocking(
+                lambda: store.reconcile_servers(
+                    tuple((server.alias, server.fingerprint) for server in settings.servers)
+                )
+            )
             await _blocking(lambda: store.reconcile_push_sources(settings.sources))
             state_lock = asyncio.Lock()
+            request_slots = asyncio.Semaphore(settings.max_concurrency)
             progress = None
             if (
                 settings.mode != "idle"
@@ -161,7 +167,9 @@ async def run(settings: Settings) -> None:
             ):
                 progress = MonitoringProgress(
                     workers={
-                        site.alias: time.monotonic() for site in settings.sites if site.enabled
+                        site.alias: time.monotonic()
+                        for site in settings.polled_sources
+                        if site.enabled
                     }
                 )
                 if settings.telegram is not None:
@@ -176,7 +184,27 @@ async def run(settings: Settings) -> None:
             if progress is not None and settings.sites:
                 workers.append(
                     asyncio.create_task(
-                        monitor_sites(settings, stopped, progress, state_lock=state_lock)
+                        monitor_sites(
+                            settings,
+                            stopped,
+                            progress,
+                            state_lock=state_lock,
+                            request_slots=request_slots,
+                        )
+                    )
+                )
+            if progress is not None and settings.servers:
+                from sentinel_bot.metrics_runtime import monitor_servers
+
+                workers.append(
+                    asyncio.create_task(
+                        monitor_servers(
+                            settings,
+                            stopped,
+                            progress,
+                            state_lock=state_lock,
+                            request_slots=request_slots,
+                        )
                     )
                 )
             if progress is not None and settings.telegram is not None:
@@ -288,10 +316,10 @@ def _current_heartbeat(
         if settings.mode != "idle":
             workers = heartbeat.get("workers")
             if not isinstance(workers, dict) or set(workers) != {
-                s.alias for s in settings.sites if s.enabled
+                s.alias for s in settings.polled_sources if s.enabled
             }:
                 return None
-            for site in settings.sites:
+            for site in settings.polled_sources:
                 if not site.enabled:
                     continue
                 value = workers.get(site.alias)
@@ -357,7 +385,7 @@ def observation_progress(settings: Settings) -> dict[str, float]:
         return {}
     return {
         site.alias: float(value)
-        for site in settings.sites
+        for site in (*settings.polled_rules, *settings.servers)
         if site.enabled
         if type(value := values.get(site.alias)) in (int, float)
         and isinstance(value, (int, float))

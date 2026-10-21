@@ -29,12 +29,14 @@ COPY config/idle.toml config/demo.toml config/sites.example.toml config/telegram
 COPY config/checks.example.toml /app/config/checks.example.toml
 COPY config/ingress.example.toml /app/config/ingress.example.toml
 COPY config/email.example.toml config/email.local.toml /app/config/
+COPY config/servers.example.toml config/servers.local.toml /app/config/
 COPY demo/site_fixture.py /app/demo/site_fixture.py
+COPY demo/metrics_fixture.py /app/demo/metrics_fixture.py
 
 USER 10001:10001
 WORKDIR /app
 STOPSIGNAL SIGTERM
-HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=3 \
+HEALTHCHECK --interval=5s --timeout=8s --start-period=15s --retries=3 \
     CMD ["python", "-m", "sentinel_bot", "healthcheck"]
 ENTRYPOINT ["python", "-m", "sentinel_bot"]
 CMD ["run"]

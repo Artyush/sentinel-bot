@@ -103,7 +103,7 @@ def settings_for(tmp_path: Path, mode: str = "idle") -> Settings:
 
 def install_fakes(monkeypatch: pytest.MonkeyPatch, api: FakeAPI, checker: FakeChecker) -> None:
     monkeypatch.setattr(telegram, "TelegramAPI", lambda token: api)
-    monkeypatch.setattr(monitoring, "HttpChecker", lambda *args: checker)
+    monkeypatch.setattr(monitoring, "HttpChecker", lambda *args, **kwargs: checker)
 
 
 async def wait_until(predicate: Callable[[], bool], task: asyncio.Task[None]) -> None:

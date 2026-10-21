@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from sentinel_bot.metric_models import IncidentRule
+
 MAX_CONFIG_BYTES = 16 * 1024
 MAX_REQUEST_BODY_BYTES = 4096
 
@@ -64,6 +66,97 @@ class SiteConfig:
     @property
     def freshness_limit(self) -> float:
         return 2 * self.poll_interval + self.total_timeout
+
+
+@dataclass(frozen=True)
+class FilesystemConfig:
+    alias: str
+    mount: str = field(repr=False)
+    trigger: float | None = 85.0
+    recover: float | None = 75.0
+
+
+@dataclass(frozen=True)
+class ServerConfig:
+    alias: str
+    url: str = field(repr=False)
+    token: str = field(default="", repr=False)
+    allowed_cidrs: tuple[str, ...] = ()
+    poll_interval: float = 30.0
+    connect_timeout: float = 5.0
+    total_timeout: float = 10.0
+    failure_confirmation: int = 3
+    recovery_confirmation: int = 2
+    reminder_interval: float = 1800.0
+    cpu_trigger: float | None = 85.0
+    cpu_recover: float | None = 75.0
+    memory_trigger: float | None = 85.0
+    memory_recover: float | None = 75.0
+    mounts: tuple[FilesystemConfig, ...] = ()
+    enabled: bool = True
+
+    @property
+    def freshness_limit(self) -> float:
+        return 2 * self.poll_interval + self.total_timeout
+
+    @property
+    def fingerprint(self) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                (
+                    self.url,
+                    self.allowed_cidrs,
+                    self.connect_timeout,
+                    self.total_timeout,
+                    [(mount.alias, mount.mount) for mount in self.mounts],
+                )
+            ).encode()
+        ).hexdigest()
+
+    @property
+    def rules(self) -> tuple[IncidentRule, ...]:
+        values: list[tuple[str, float | None, float | None, str | None]] = [
+            ("exporter", None, None, None)
+        ]
+        if self.cpu_trigger is not None:
+            values.append(("cpu", self.cpu_trigger, self.cpu_recover, None))
+        if self.memory_trigger is not None:
+            values.append(("memory", self.memory_trigger, self.memory_recover, None))
+        values.extend(
+            ("fs_" + m.alias, m.trigger, m.recover, m.mount)
+            for m in self.mounts
+            if m.trigger is not None
+        )
+        return tuple(
+            IncidentRule(
+                alias=f"{self.alias}/{name}",
+                fingerprint=hashlib.sha256(
+                    json.dumps(
+                        (
+                            self.url,
+                            self.allowed_cidrs,
+                            self.connect_timeout,
+                            self.total_timeout,
+                            name,
+                            trigger,
+                            recover,
+                            mount,
+                            self.failure_confirmation,
+                            self.recovery_confirmation,
+                        )
+                    ).encode()
+                ).hexdigest(),
+                poll_interval=self.poll_interval,
+                total_timeout=self.total_timeout,
+                failure_confirmation=self.failure_confirmation,
+                recovery_confirmation=self.recovery_confirmation,
+                reminder_interval=self.reminder_interval,
+                trigger=trigger,
+                recover=recover,
+                enabled=self.enabled,
+            )
+            for name, trigger, recover, mount in values
+        )
 
 
 @dataclass(frozen=True)
@@ -159,6 +252,15 @@ class Settings:
     ingress: IngressSettings | None = None
     sources: tuple[PushSource, ...] = ()
     email: EmailSettings | None = field(default=None, repr=False)
+    servers: tuple[ServerConfig, ...] = ()
+
+    @property
+    def polled_sources(self) -> tuple[SiteConfig | ServerConfig, ...]:
+        return (*self.sites, *self.servers)
+
+    @property
+    def polled_rules(self) -> tuple[SiteConfig | IncidentRule, ...]:
+        return (*self.sites, *(rule for server in self.servers for rule in server.rules))
 
 
 def _duration(value: object, field: str, lower: float, upper: float) -> float:
@@ -313,6 +415,201 @@ def _site(value: object, mode: str) -> SiteConfig:
         enabled=enabled,
         method=method,
         request_body=request_body,
+    )
+
+
+def _server_thresholds(
+    row: dict[str, object], prefix: str = ""
+) -> tuple[float | None, float | None]:
+    enabled = row.get(prefix + "alerts", True)
+    if type(enabled) is not bool:
+        raise ConfigError("Server alert flags must be booleans.")
+    trigger = _duration(row.get(prefix + "trigger_percent", 85), "trigger_percent", 0, 100)
+    recover = _duration(row.get(prefix + "recovery_percent", 75), "recovery_percent", 0, 100)
+    if recover >= trigger:
+        raise ConfigError("Resource recovery threshold must be lower than its trigger.")
+    return (trigger, recover) if enabled else (None, None)
+
+
+def _server(value: object, mode: str, environ: Mapping[str, str]) -> ServerConfig:
+    allowed = {
+        "alias",
+        "url",
+        "token_env",
+        "allowed_cidrs",
+        "poll_interval_seconds",
+        "connect_timeout_seconds",
+        "total_timeout_seconds",
+        "failure_confirmation",
+        "recovery_confirmation",
+        "reminder_interval_seconds",
+        "enabled",
+        "cpu_alerts",
+        "cpu_trigger_percent",
+        "cpu_recovery_percent",
+        "memory_alerts",
+        "memory_trigger_percent",
+        "memory_recovery_percent",
+        "filesystems",
+    }
+    if not isinstance(value, dict) or set(value) - allowed:
+        raise ConfigError("Unsupported server configuration fields.")
+    row: dict[str, object] = value
+    alias = row.get("alias")
+    if not isinstance(alias, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", alias):
+        raise ConfigError("Server alias must be a bounded identifier.")
+    enabled = row.get("enabled", True)
+    if type(enabled) is not bool:
+        raise ConfigError("Server enabled must be a boolean.")
+    cidrs = row.get("allowed_cidrs", [])
+    if not isinstance(cidrs, list) or len(cidrs) > 16 or any(not isinstance(x, str) for x in cidrs):
+        raise ConfigError("Server allowed_cidrs must be a bounded list of networks.")
+    networks = []
+    for item in cidrs:
+        try:
+            if "%" in item:
+                raise ValueError
+            network = ipaddress.ip_network(item, strict=True)
+            for address in (network.network_address, network.broadcast_address):
+                if (
+                    address.is_loopback
+                    or address.is_link_local
+                    or address.is_multicast
+                    or address.is_unspecified
+                    or address.is_reserved
+                    or (
+                        isinstance(address, ipaddress.IPv6Address)
+                        and (address.ipv4_mapped is not None or address.scope_id is not None)
+                    )
+                ):
+                    raise ValueError
+        except ValueError as exc:
+            raise ConfigError("Server address allowlist contains an unsupported network.") from exc
+        networks.append(str(network))
+    if len(set(networks)) != len(networks):
+        raise ConfigError("Server address networks must be unique.")
+    url = row.get("url")
+    if (
+        not isinstance(url, str)
+        or len(url) > 2048
+        or not url
+        or any(ord(c) <= 32 or ord(c) == 127 for c in url)
+        or any(c in url for c in "?#\\")
+    ):
+        raise ConfigError("Server URL must be a bounded fixed-origin HTTPS URL.")
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        port = parsed.port
+        if host is None or parsed.username is not None or parsed.password is not None:
+            raise ValueError
+        host = host.encode("idna").decode("ascii").lower().rstrip(".")
+        port = port if port is not None else (443 if parsed.scheme == "https" else 80)
+        if not 1 <= port <= 65535:
+            raise ValueError
+        if mode == "demo":
+            if parsed.scheme != "http" or host != "metrics-fixture" or port not in {9100, 9101}:
+                raise ValueError
+        else:
+            if parsed.scheme != "https" or host == "localhost" or host.endswith(".localhost"):
+                raise ValueError
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", host) or re.fullmatch(
+                    r"(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))*", host
+                ):
+                    raise ValueError from None
+            else:
+                if (
+                    address.is_loopback
+                    or address.is_link_local
+                    or address.is_multicast
+                    or address.is_unspecified
+                    or address.is_reserved
+                    or (
+                        isinstance(address, ipaddress.IPv6Address)
+                        and (address.ipv4_mapped is not None or address.scope_id is not None)
+                    )
+                ):
+                    raise ValueError
+                if not address.is_global and not any(
+                    address in ipaddress.ip_network(n) for n in networks
+                ):
+                    raise ValueError
+        authority = f"[{host}]" if ":" in host else host
+        if parsed.port is not None:
+            authority += f":{port}"
+        url = urlunsplit((parsed.scheme, authority, parsed.path or "/", "", ""))
+    except (ValueError, UnicodeError) as exc:
+        raise ConfigError("Server URL violates the HTTPS/address policy.") from exc
+    token_name = row.get("token_env")
+    if token_name is not None and (
+        not isinstance(token_name, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", token_name)
+    ):
+        raise ConfigError("Server token_env must name an environment variable.")
+    token = ""
+    if mode != "demo":
+        if token_name is None:
+            raise ConfigError("Server HTTPS polling requires a token environment reference.")
+        if enabled:
+            assert isinstance(token_name, str)
+            token = environ.get(token_name, "")
+            if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token):
+                raise ConfigError("Enabled server requires a valid token environment value.")
+    mounts_raw = row.get("filesystems", [])
+    if not isinstance(mounts_raw, list) or len(mounts_raw) > 4:
+        raise ConfigError("A server supports at most four configured filesystems.")
+    mounts = []
+    for item in mounts_raw:
+        if not isinstance(item, dict) or set(item) - {
+            "alias",
+            "mount",
+            "trigger_percent",
+            "recovery_percent",
+            "alerts",
+        }:
+            raise ConfigError("Unsupported filesystem fields.")
+        name = item.get("alias")
+        mount = item.get("mount")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", name):
+            raise ConfigError("Filesystem alias must be a bounded identifier.")
+        if (
+            not isinstance(mount, str)
+            or not mount.startswith("/")
+            or len(mount) > 256
+            or any(ord(c) < 32 or ord(c) == 127 for c in mount)
+        ):
+            raise ConfigError("Filesystem mount must be a bounded absolute path.")
+        trigger, recover = _server_thresholds(item)
+        mounts.append(FilesystemConfig(name, mount, trigger, recover))
+    if len({m.alias for m in mounts}) != len(mounts) or len({m.mount for m in mounts}) != len(
+        mounts
+    ):
+        raise ConfigError("Filesystem aliases and mount paths must be unique per server.")
+    connect = _duration(row.get("connect_timeout_seconds", 5), "connect_timeout_seconds", 0.1, 30)
+    total = _duration(row.get("total_timeout_seconds", 10), "total_timeout_seconds", 0.2, 120)
+    if connect > total:
+        raise ConfigError("Connect timeout cannot exceed the total deadline.")
+    cpu = _server_thresholds(row, "cpu_")
+    memory = _server_thresholds(row, "memory_")
+    return ServerConfig(
+        alias,
+        url,
+        token,
+        tuple(networks),
+        _duration(row.get("poll_interval_seconds", 30), "poll_interval_seconds", 0.1, 86400),
+        connect,
+        total,
+        _integer(row.get("failure_confirmation", 3), "failure_confirmation", 1, 100),
+        _integer(row.get("recovery_confirmation", 2), "recovery_confirmation", 1, 100),
+        _duration(
+            row.get("reminder_interval_seconds", 1800), "reminder_interval_seconds", 1, 604800
+        ),
+        *cpu,
+        *memory,
+        tuple(mounts),
+        enabled,
     )
 
 
@@ -512,7 +809,7 @@ def _ingress(value: object) -> IngressSettings | None:
 
 def _sources(
     value: object,
-    all_sites: tuple[SiteConfig, ...],
+    all_sites: tuple[SiteConfig | ServerConfig, ...],
     environ: Mapping[str, str],
     enabled: bool,
 ) -> tuple[PushSource, ...]:
@@ -543,9 +840,9 @@ def _sources(
         if not isinstance(mode, str) or mode not in {"push", "hybrid"}:
             raise ConfigError("Source mode must be push or hybrid.")
         if mode == "push" and alias in site_aliases:
-            raise ConfigError("A push-only source cannot have an outbound website check.")
+            raise ConfigError("A push-only source cannot have an outbound polling target.")
         if mode == "hybrid" and alias not in enabled_sites:
-            raise ConfigError("A hybrid source requires an explicitly enabled website check.")
+            raise ConfigError("A hybrid source requires an explicitly enabled polling source.")
         types = row.get("allowed_types")
         if (
             not isinstance(types, list)
@@ -631,7 +928,8 @@ def load_settings(path: Path, environ: Mapping[str, str] | None = None) -> Setti
     document = _read_document(path)
     if (
         "runtime" not in document
-        or set(document) - {"runtime", "sites", "telegram", "ingress", "sources", "email"}
+        or set(document)
+        - {"runtime", "sites", "telegram", "ingress", "sources", "email", "servers"}
         or not isinstance(document["runtime"], dict)
     ):
         raise ConfigError("Unsupported configuration sections or missing [runtime].")
@@ -660,10 +958,23 @@ def load_settings(path: Path, environ: Mapping[str, str] | None = None) -> Setti
     sites = tuple(site for site in all_sites if site.enabled)
     env = os.environ if environ is None else environ
     ingress = _ingress(document.get("ingress", {}))
-    sources = _sources(document.get("sources", []), all_sites, env, ingress is not None)
-    if mode == "idle" and (sites or ingress is not None):
+    server_rows = document.get("servers", [])
+    if not isinstance(server_rows, list) or len(server_rows) > 20:
+        raise ConfigError("Inventory supports at most 20 server tables.")
+    all_servers = tuple(_server(row, mode, env) for row in server_rows)
+    if len({server.alias for server in all_servers}) != len(all_servers):
+        raise ConfigError("Server aliases must be unique.")
+    if {server.alias for server in all_servers} & {site.alias for site in all_sites}:
+        raise ConfigError("Website and server aliases must be distinct.")
+    servers = tuple(server for server in all_servers if server.enabled)
+    if len(sites) + sum(len(server.rules) for server in servers) > 40:
+        raise ConfigError("Expanded polling inventory supports at most 40 incident rules.")
+    sources = _sources(
+        document.get("sources", []), (*all_sites, *all_servers), env, ingress is not None
+    )
+    if mode == "idle" and (sites or servers or ingress is not None):
         raise ConfigError("Idle mode cannot contain enabled inputs.")
-    if mode != "idle" and not sites and not sources:
+    if mode != "idle" and not sites and not sources and not servers:
         raise ConfigError("Monitoring mode requires at least one enabled source.")
     telegram = _telegram(document.get("telegram", {}), env, mode)
     email = _email(document.get("email", {}), env, mode)
@@ -723,4 +1034,5 @@ def load_settings(path: Path, environ: Mapping[str, str] | None = None) -> Setti
         ingress,
         sources,
         email,
+        servers,
     )
