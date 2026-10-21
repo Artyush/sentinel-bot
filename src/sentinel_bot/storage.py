@@ -14,6 +14,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from sentinel_bot.config import IngressSettings, PushSource, SiteConfig
+from sentinel_bot.demo import DEMO_TELEGRAM_DESTINATION
 from sentinel_bot.events import (
     EventRejected,
     IncomingEvent,
@@ -1363,6 +1364,7 @@ class SQLiteStore:
         timestamp = _timestamp(now)
         if (
             destination is not None
+            and destination != DEMO_TELEGRAM_DESTINATION
             and re.fullmatch(r"telegram:-?[1-9][0-9]*:[0-9]+", destination) is None
         ):
             raise ValueError("Telegram destination must contain fixed numeric chat/topic IDs")

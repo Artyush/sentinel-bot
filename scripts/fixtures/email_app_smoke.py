@@ -165,7 +165,15 @@ async def scenario(
                 assert response.status == 202
                 receipt = await response.json()
                 assert receipt["outcome"] == "notification"
-            await until(lambda: store.email_delivery_status()["retrying"] == 1, app)
+            await until(
+                lambda: (
+                    (progress := store.email_delivery_status())["accepted"] == 1
+                    and progress["failed"] == 1
+                    and progress["retrying"] == 1
+                    and progress["in_flight"] == 0
+                ),
+                app,
+            )
             status = store.email_delivery_status()
             assert status["accepted"] == 1 and status["failed"] == 1
             assert fixture.accepted == [fixture.accepted_recipient]

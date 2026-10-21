@@ -17,9 +17,12 @@
 !config/email.local.toml
 !config/servers.example.toml
 !config/servers.local.toml
+!config/release.local.toml
 !demo/
 !demo/site_fixture.py
 !demo/metrics_fixture.py
+!demo/telegram_fixture.py
+!demo/control.py
 src/**/__pycache__/
 src/**/*.pyc
 src/**/*.pyo

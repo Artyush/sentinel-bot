@@ -40,6 +40,7 @@ async def main() -> None:
     app = web.Application(client_max_size=32)
     app.router.add_get("/health", healthy)
     app.router.add_get("/{alias}", observe)
+    app.router.add_post("/{alias}", observe)
     app.router.add_post("/control/{alias}", control)
     runner = web.AppRunner(
         app,

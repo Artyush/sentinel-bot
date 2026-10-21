@@ -6,6 +6,7 @@ This guide covers the implemented application. For every supported TOML key, env
 
 - [Available features](#available-features)
 - [Choose a configuration](#choose-a-configuration)
+- [Complete offline demonstration](#complete-offline-demonstration)
 - [Local Docker and Mailpit](#local-docker-and-mailpit)
 - [Offline website demo](#offline-website-demo)
 - [Offline incident email demo](#offline-incident-email-demo)
@@ -55,9 +56,10 @@ Run commands from the cloned repository root. Docker requires a running engine a
 | [`config/email.local.toml`](../config/email.local.toml) | Offline website incidents delivered to Mailpit | Synthetic fixture, synthetic addresses, no provider account |
 | [`config/servers.example.toml`](../config/servers.example.toml) | Operator-provisioned Linux Node Exporter | Verified HTTPS and fixed-origin Bearer authentication; explicit private CIDRs |
 | [`config/servers.local.toml`](../config/servers.local.toml) | Offline Linux resource incidents delivered to Mailpit | Synthetic exporter only; no host metrics, credentials or mounts |
+| [`config/release.local.toml`](../config/release.local.toml) | Complete offline demonstration | Synthetic websites/metrics, authenticated incoming events, fake Telegram and Mailpit |
 | [`config/checks.example.toml`](../config/checks.example.toml) | Shared endpoint inventory for website, Telegram and production email configurations | Endpoint tables only; do not select it as the main configuration |
 
-The nine main configurations and shared endpoint inventory are baked into the image. Edit a supported file and rebuild; creating another host TOML file does not automatically put it in the image. Native execution can select another main file with `--config`. Main files support `[runtime]`, `[telegram]`, optional `[email]`/`[ingress]`/`[[sources]]`, `[[servers]]` and inline `[[sites]]`, or `runtime.sites_file` instead of inline sites. The separate endpoint file supports only `[[sites]]`; server tables belong in the main file. Unknown keys fail validation.
+The ten main configurations and shared endpoint inventory are baked into the image. Edit a supported file and rebuild; creating another host TOML file does not automatically put it in the image. Native execution can select another main file with `--config`. Main files support `[runtime]`, `[telegram]`, optional `[email]`/`[ingress]`/`[[sources]]`, `[[servers]]` and inline `[[sites]]`, or `runtime.sites_file` instead of inline sites. The separate endpoint file supports only `[[sites]]`; server tables belong in the main file. Unknown keys fail validation.
 
 If `.env` does not exist, copy the template once:
 
@@ -68,6 +70,10 @@ cp .env.example .env
 Keep an existing `.env` and edit it instead of overwriting it. Compose loads it automatically; the native Python application does not. Exported shell variables can override Compose's `.env` values; see [Docker's interpolation rules](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/).
 
 Use a consistent project name (`-p`) for every command targeting a stack. The examples use separate local, live and demo projects so their state and network settings stay independent. Copy commands only, without shell prompts, command output or JSON results.
+
+## Complete offline demonstration
+
+The [complete demo guide](demo.md) starts synthetic website and Linux sources, an authenticated push-only sender, a fake Telegram inbox and Mailpit with one Compose command. It demonstrates independent monitoring, outage/recovery, incoming-event duplicates, channel failure/retry and persisted state after a restart. No Telegram bot, provider account, private server or local `.env` is required. The initial build downloads pinned public images and Python packages; running the built demonstration uses an isolated application network.
 
 ## Local Docker and Mailpit
 
@@ -499,6 +505,7 @@ python3 scripts/telegram_smoke.py
 python3 scripts/ingress_smoke.py
 python3 scripts/email_smoke.py
 python3 scripts/metrics_smoke.py
+python3 scripts/release_smoke.py
 ```
 
-Tests use loopback HTTP/SMTP, fake Telegram and temporary SQLite. Foundation smoke checks separate local/server stacks, Mailpit, ownership/health/state/SIGTERM and container restrictions. Website smoke checks independent sources, outage/recovery and restart. Telegram smoke runs the real application/HTTP boundary against isolated local fixtures, including access checks, 429/retry and restart acceptance. Ingress smoke checks authenticated acceptance, duplicate/conflict behavior, terminal occurrences, ordered Telegram delivery/retry, push-only isolation and restart. Email smoke checks Mailpit outage/recovery delivery and restart without accepted resends, plus loopback-only provider scenarios. Metrics smoke checks synthetic CPU/memory/filesystem incidents, hysteresis, unknown readings, exporter availability, independent sources, Mailpit delivery, cached server commands and CPU/reset/restart behavior; its separate loopback fixture runs the real runtime and HTTP email boundary. Scripts clear inherited credentials, select `.env.example`, use unique temporary projects and remove only their own containers/volumes. They do not contact real Telegram, Mailchimp or monitored public websites. Local passes do not establish a GitHub Actions run or deployment.
+Tests use loopback HTTP/SMTP, fake Telegram and temporary SQLite. Foundation smoke checks separate local/server stacks, Mailpit, ownership/health/state/SIGTERM and container restrictions. Website smoke checks independent sources, outage/recovery and restart. Telegram smoke runs the real application/HTTP boundary against isolated local fixtures, including access checks, 429/retry and restart acceptance. Ingress smoke checks authenticated acceptance, duplicate/conflict behavior, terminal occurrences, ordered Telegram delivery/retry, push-only isolation and restart. Email smoke checks Mailpit outage/recovery delivery and restart without accepted resends, plus loopback-only provider scenarios. Metrics smoke checks synthetic CPU/memory/filesystem incidents, hysteresis, unknown readings, exporter availability, independent sources, Mailpit delivery, cached server commands and CPU/reset/restart behavior; its separate loopback fixture runs the real runtime and HTTP email boundary. Release smoke runs the combined demonstration and its documented scenario. Scripts clear inherited credentials, select `.env.example`, use unique temporary projects and remove only their own containers/volumes. They do not contact real Telegram, Mailchimp or monitored public websites. Local passes do not establish a GitHub Actions run or deployment.

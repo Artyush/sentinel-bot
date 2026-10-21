@@ -14,6 +14,8 @@ import aiohttp
 from aiohttp.resolver import AsyncResolver
 from yarl import URL
 
+from sentinel_bot.demo import DEMO_TELEGRAM_ORIGIN, DEMO_TELEGRAM_TOKEN
+
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_UPDATES = 20
 MAX_TEXT_UNITS = 4096
@@ -100,7 +102,7 @@ def _fixture_origin(value: str) -> str:
 
 
 class TelegramAPI:
-    """Use a fixed verified HTTPS API, with a loopback-only test seam.
+    """Use verified Telegram HTTPS or the explicitly selected fixed synthetic sink.
 
     Rate limiting, persistent retry and polling ownership belong to orchestration.
     This adapter never changes a webhook or retries an external send itself.
@@ -112,9 +114,14 @@ class TelegramAPI:
         *,
         fixture_base_url: str | None = None,
         request_timeout: float = 10.0,
+        demo: bool = False,
     ) -> None:
         if not isinstance(token, str) or _TOKEN.fullmatch(token) is None:
             raise ValueError("Telegram token has an invalid format.")
+        if type(demo) is not bool or (
+            demo and (token != DEMO_TELEGRAM_TOKEN or fixture_base_url is not None)
+        ):
+            raise ValueError("Demo Telegram requires its fixed synthetic credential and origin.")
         if (
             isinstance(request_timeout, bool)
             or not math.isfinite(request_timeout)
@@ -122,11 +129,12 @@ class TelegramAPI:
         ):
             raise ValueError("Telegram request timeout must be between zero and 60 seconds.")
         self._token = token
-        self._origin = (
+        origin = (
             "https://api.telegram.org"
             if fixture_base_url is None
             else _fixture_origin(fixture_base_url)
         )
+        self._origin = DEMO_TELEGRAM_ORIGIN if demo else origin
         self._request_timeout = request_timeout
         self._session: aiohttp.ClientSession | None = None
         self._resolver: AsyncResolver | None = None

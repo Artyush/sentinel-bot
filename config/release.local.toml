@@ -1,0 +1,83 @@
+# Complete offline demo; all endpoints and identities are synthetic.
+[runtime]
+mode = "demo"
+state_dir = "data"
+heartbeat_interval_seconds = 0.5
+health_timeout_seconds = 10
+shutdown_timeout_seconds = 10
+max_concurrency = 4
+
+[telegram]
+enabled = true
+provider = "demo"
+
+[email]
+enabled = true
+provider = "local_smtp"
+local_host = "mailpit"
+local_port = 1025
+request_timeout_seconds = 2
+
+[ingress]
+enabled = true
+host = "0.0.0.0"
+port = 8080
+
+[[sources]]
+alias = "edge"
+mode = "push"
+allowed_types = ["service.health"]
+token_env = "SENTINEL_SOURCE_DEMO_TOKEN"
+
+[[sites]]
+alias = "primary"
+url = "http://site-fixture:8080/primary"
+marker = "READY"
+poll_interval_seconds = 1
+connect_timeout_seconds = 0.5
+total_timeout_seconds = 1
+failure_confirmation = 3
+recovery_confirmation = 2
+
+[[sites]]
+alias = "secondary"
+url = "http://site-fixture:8080/secondary"
+method = "POST"
+json_body = { check = "ready" }
+marker = "READY"
+poll_interval_seconds = 1.5
+connect_timeout_seconds = 0.5
+total_timeout_seconds = 1
+failure_confirmation = 3
+recovery_confirmation = 2
+
+[[servers]]
+alias = "node"
+url = "http://metrics-fixture:9100/metrics"
+poll_interval_seconds = 1
+connect_timeout_seconds = 0.5
+total_timeout_seconds = 1
+failure_confirmation = 3
+recovery_confirmation = 2
+cpu_alerts = false
+
+[[servers.filesystems]]
+alias = "root"
+mount = "/"
+alerts = false
+
+[[servers]]
+alias = "peer"
+url = "http://metrics-fixture:9101/metrics"
+poll_interval_seconds = 1.5
+connect_timeout_seconds = 0.5
+total_timeout_seconds = 1
+failure_confirmation = 3
+recovery_confirmation = 2
+cpu_alerts = false
+memory_alerts = false
+
+[[servers.filesystems]]
+alias = "root"
+mount = "/"
+alerts = false
