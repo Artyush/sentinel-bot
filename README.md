@@ -30,3 +30,5 @@ Monitoring is read-only and limited to explicitly configured sources. Server exp
 [All supported configuration options](docs/configuration.md)
 
 [Incoming events API: requests, authentication and responses](docs/api.md)
+
+Licensed under the [MIT License](LICENSE).
