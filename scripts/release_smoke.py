@@ -18,6 +18,7 @@ from metrics_smoke import rules, servers
 from monitoring_smoke import sources
 
 NEW_RELEASE_FILES = (
+    "LICENSE",
     "compose.release.yaml",
     "config/release.local.toml",
     "src/sentinel_bot/demo.py",

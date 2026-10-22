@@ -1,7 +1,7 @@
 FROM python:3.14.8-slim-bookworm@sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83 AS builder
 
 WORKDIR /build
-COPY requirements-build.lock requirements.lock pyproject.toml README.md ./
+COPY requirements-build.lock requirements.lock pyproject.toml README.md LICENSE ./
 COPY src/ ./src/
 RUN python -m pip install --no-cache-dir --require-hashes -r requirements-build.lock \
     && python -m pip install --no-cache-dir --no-compile --require-hashes \
@@ -10,6 +10,8 @@ RUN python -m pip install --no-cache-dir --require-hashes -r requirements-build.
         --target /opt/application .
 
 FROM python:3.14.8-slim-bookworm@sha256:48b13b003dda20b16f9442b8475aa05fe21bf6579a8c881db92ffb4d8fd20f83
+
+LABEL org.opencontainers.image.licenses="MIT"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -24,6 +26,7 @@ RUN groupadd --gid 10001 sentinel \
     && chown 10001:10001 /var/lib/sentinel
 
 COPY --from=builder /opt/application/ /opt/application/
+COPY LICENSE /app/LICENSE
 COPY config/idle.toml /app/config.toml
 COPY config/idle.toml config/demo.toml config/sites.example.toml config/telegram.example.toml /app/config/
 COPY config/checks.example.toml /app/config/checks.example.toml
