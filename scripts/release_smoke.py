@@ -322,6 +322,9 @@ def verify_release(stack: ReleaseStack) -> None:
     assert stack.execute("python", "-m", "sentinel_bot", "healthcheck") == "healthy"
     metadata = startup_metadata(stack)
     starts = http_json(telegram_url + "/api/messages")["startup_count"]
+    dependencies = {
+        service: stack.inspect(service) for service in SERVICES if service != "sentinel"
+    }
     stack.compose("stop", "--timeout", "15", "sentinel")
     restored = json.loads(stack.compose("run", "--rm", "--no-deps", "sentinel", "status"))
     assert sources(restored)["primary"]["fresh"] is False
@@ -330,7 +333,21 @@ def verify_release(stack: ReleaseStack) -> None:
     assert rules(servers(restored)["node"])["memory"]["incident_id"] == metric_incident
     assert restored["telegram"]["accepted"] == 2 and restored["email"]["accepted"] == 6
     assert restored["telegram"]["pending"] == 1
-    stack.compose("up", "-d", "--wait", "--wait-timeout", "90", "sentinel")
+    # Dependencies hold volatile inboxes, event state and assigned host ports.
+    stack.compose(
+        "up", "-d", "--no-deps", "--no-recreate", "--wait", "--wait-timeout", "90", "sentinel"
+    )
+    for service, before in dependencies.items():
+        after = stack.inspect(service)
+        assert after["Id"] == before["Id"], f"{service} was recreated during Sentinel restart"
+        assert after["State"]["StartedAt"] == before["State"]["StartedAt"], (
+            f"{service} was restarted during Sentinel restart"
+        )
+        assert after["NetworkSettings"]["Ports"] == before["NetworkSettings"]["Ports"], (
+            f"{service} published ports changed during Sentinel restart"
+        )
+    assert stack.inbox_url("telegram-fixture", 8081) == telegram_url
+    assert stack.inbox_url("mailpit", 8025) == mail_url
     assert startup_metadata(stack)["count"] == metadata["count"] + 1
     assert http_json(telegram_url + "/api/messages")["startup_count"] == starts + 1
     assert stack.event(delayed) == receipt
