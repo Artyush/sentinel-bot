@@ -30,8 +30,10 @@ COPY config/checks.example.toml /app/config/checks.example.toml
 COPY config/ingress.example.toml /app/config/ingress.example.toml
 COPY config/email.example.toml config/email.local.toml /app/config/
 COPY config/servers.example.toml config/servers.local.toml /app/config/
+COPY config/release.local.toml /app/config/
 COPY demo/site_fixture.py /app/demo/site_fixture.py
 COPY demo/metrics_fixture.py /app/demo/metrics_fixture.py
+COPY demo/telegram_fixture.py demo/control.py /app/demo/
 
 USER 10001:10001
 WORKDIR /app

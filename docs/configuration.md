@@ -29,6 +29,7 @@ The supplied image contains these inventories:
 | [config/email.local.toml](../config/email.local.toml) | `/app/config/email.local.toml` | Synthetic websites with Mailpit incident email |
 | [config/servers.example.toml](../config/servers.example.toml) | `/app/config/servers.example.toml` | Linux Node Exporter through an authenticated HTTPS endpoint |
 | [config/servers.local.toml](../config/servers.local.toml) | `/app/config/servers.local.toml` | Synthetic Linux readings and Mailpit incidents |
+| [config/release.local.toml](../config/release.local.toml) | `/app/config/release.local.toml` | Combined synthetic websites/metrics, incoming events, fake Telegram and Mailpit |
 | [config/checks.example.toml](../config/checks.example.toml) | `/app/config/checks.example.toml` | Shared website/Telegram/email endpoint tables; not a standalone main configuration |
 
 Compose selects `/app/config.toml` by default. Set `SENTINEL_CONTAINER_CONFIG` to another **main configuration path in this table**, not the endpoint-only `checks.example.toml`. `compose.monitoring.yaml` explicitly selects `/app/config/demo.toml` instead. Host paths and arbitrary new TOML files are not mounted or copied automatically; a native `--config` can select another readable file, but the supplied Docker packaging includes only the listed examples. Rebuild after editing a packaged configuration or endpoint inventory.
@@ -87,7 +88,7 @@ The endpoint file accepts only repeated `[[sites]]` tables. Do not place `[runti
 | `max_concurrency` | `5` | Integer `1`–`5`; shared simultaneous website/exporter request limit |
 | `sites_file` | Omitted | Optional nonempty relative inventory path, at most 2,048 characters, resolved from the main configuration's directory. Absolute paths, `..` segments, backslashes, NUL/control characters and paths/symlinks escaping that directory are rejected. Cannot be combined with inline `[[sites]]`. |
 
-`idle` permits no enabled monitoring inputs and can optionally run Telegram or email alone. `monitor` requires an enabled website, server or incoming source. `demo` requires an enabled synthetic website or server, permits only named fixture origins and rejects enabled live Telegram, Mailchimp email or ingress; local SMTP incident email is allowed. Disabled inventory rows remain subject to structural validation in every mode; disabled servers do not read token values.
+`idle` permits no enabled monitoring inputs and can optionally run Telegram or email alone. `monitor` and `demo` require an enabled website, server or incoming source. In `demo`, polled targets are restricted to named synthetic fixture origins. Its notification channels are restricted to fake Telegram and local SMTP; live Telegram and Mailchimp email are rejected. The combined demonstration also enables authenticated incoming events on its private application network. Disabled inventory rows remain subject to structural validation in every mode; disabled servers do not read token values.
 
 The default Compose shutdown grace period is 15 seconds. If you raise the application shutdown deadline, also allow enough container grace time for cleanup. A larger health timeout changes heartbeat freshness; it does not alter the fixed Telegram worker progress threshold or website progress formula.
 
@@ -192,7 +193,16 @@ Exporter availability and each enabled resource rule have separate confirmed sta
 
 ## Telegram
 
-The only TOML key in `[telegram]` is `enabled`, a boolean defaulting to `false`. Omit the table to leave Telegram disabled. Credentials are validated and workers start only when enabled. For Telegram without website polling, a complete inventory is:
+`[telegram]` supports the following settings. Omit the table to leave Telegram disabled. Credentials are validated and workers start only when enabled.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Boolean; enable the selected Telegram adapter and its workers. |
+| `provider` | `"telegram"` | `"telegram"` for the fixed production Bot API, or `"demo"` for the fixed synthetic fixture in `runtime.mode = "demo"` only. |
+
+The demo provider uses fixed synthetic credentials, destination and authorized user rather than reading live `SENTINEL_TELEGRAM_*` values. Its origin is the named fixture on the isolated Compose network; it cannot select a different API URL or external destination. The [combined demo guide](demo.md) describes its inbox and controls. Selecting `provider = "demo"` in live/idle mode, or enabling production Telegram in demo mode, fails validation.
+
+For Telegram without website polling, a complete inventory is:
 
 ```toml
 [runtime]
@@ -308,7 +318,9 @@ At most 20 distinct configured source aliases are allowed across sites, servers 
 | `SENTINEL_TELEGRAM_*` above | Must be exported into the process environment | Explicitly interpolated from the shell or `.env`; absent values become empty |
 | `SENTINEL_EMAIL_*` above | Must be exported into the process environment | Explicitly interpolated from the shell or `.env`; offline email/metrics overrides supply fixed synthetic addresses |
 | `SENTINEL_SERVER_NODE_TOKEN` | Value of the example server's `token_env`; exported only for enabled real polling | Forwarded explicitly by the base file; extra token names require extra Compose forwarding |
+| `SENTINEL_SOURCE_DEMO_TOKEN` | Synthetic source credential for the combined demonstration | Fixed literal in `compose.release.yaml`; do not reuse as a live credential |
 | `MAILPIT_HTTP_PORT` | Not used by the Python application | Mailpit loopback UI host port, default `8025`; normally `1`–`65535`, with `0` requesting automatic Docker allocation; relevant only with the local override |
+| `TELEGRAM_DEMO_HTTP_PORT` | Not used by the Python application | Fake Telegram inbox loopback host port, default `8026`; used only by the combined demonstration |
 | `COMPOSE_PROJECT_NAME` | Not used by the Python application | Compose project/container/network/volume namespace; `docker compose -p NAME` selects it explicitly |
 
 The base `compose.yaml` permits outbound HTTPS for real websites, Telegram and Mailchimp Transactional. The automatic `compose.override.yaml` adds Mailpit and makes the application network internal. The explicit monitoring override also uses an internal network. Use the launch commands for the intended network in the [running guide](running.md); changing a configuration filename does not change network isolation. Distinct project names use separate state volumes, but must not run competing pollers with the same Telegram token.

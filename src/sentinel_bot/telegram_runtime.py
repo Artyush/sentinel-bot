@@ -472,8 +472,15 @@ async def run_telegram(
     """Keep source checks running through expected channel outages; supervise all workers."""
     config = settings.telegram
     assert config is not None
+    if (settings.mode == "demo") != (config.provider == "demo"):
+        raise TelegramConfigurationError("Demo mode requires the synthetic Telegram provider.")
     store = SQLiteStore(settings.state_dir)
-    async with TelegramAPI(config.token) as api:
+    api = (
+        TelegramAPI(config.token, demo=True)
+        if config.provider == "demo"
+        else TelegramAPI(config.token)
+    )
+    async with api:
         identity = await _startup(api, store, state_lock, stopped, progress)
         if identity is None:
             return

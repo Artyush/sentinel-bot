@@ -1,0 +1,57 @@
+services:
+  sentinel:
+    environment:
+      SENTINEL_CONFIG: /app/config/release.local.toml
+      SENTINEL_EMAIL_API_KEY: ""
+      SENTINEL_EMAIL_FROM: sentinel@example.test
+      SENTINEL_EMAIL_RECIPIENTS: operator@example.test,backup@example.test
+      SENTINEL_TELEGRAM_BOT_TOKEN: ""
+      SENTINEL_TELEGRAM_CHAT_ID: ""
+      SENTINEL_TELEGRAM_ALLOWED_USER_IDS: ""
+      SENTINEL_TELEGRAM_TOPIC_ID: ""
+      SENTINEL_SERVER_NODE_TOKEN: ""
+      SENTINEL_SOURCE_APP_TOKEN: ""
+      SENTINEL_SOURCE_DEMO_TOKEN: synthetic_release_source_token_1234567890
+    depends_on:
+      telegram-fixture:
+        condition: service_healthy
+
+  telegram-fixture:
+    container_name: "${COMPOSE_PROJECT_NAME}-telegram-fixture"
+    image: sentinel-bot:local
+    entrypoint: ["python", "/app/demo/telegram_fixture.py"]
+    command: []
+    user: "10001:10001"
+    read_only: true
+    restart: unless-stopped
+    stop_grace_period: 5s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 32
+    mem_limit: 64m
+    cpus: 0.25
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=4m,uid=10001,gid=10001,mode=1770
+    ports:
+      - "127.0.0.1:${TELEGRAM_DEMO_HTTP_PORT:-8026}:8081"
+    networks:
+      - sentinel
+      - telegram-ui
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket\nwith socket.create_connection(('127.0.0.1', 8081), timeout=1) as connection:\n    connection.sendall(b'GET /health HTTP/1.0\\r\\n\\r\\n')\n    with connection.makefile('rb') as response:\n        assert response.readline(128).split()[1:2] == [b'200']"]
+      interval: 5s
+      timeout: 3s
+      start_period: 15s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "2"
+
+networks:
+  sentinel:
+    internal: true
+  telegram-ui:

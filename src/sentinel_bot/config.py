@@ -14,6 +14,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from sentinel_bot.demo import (
+    DEMO_TELEGRAM_CHAT_ID,
+    DEMO_TELEGRAM_TOKEN,
+    DEMO_TELEGRAM_USER_ID,
+)
 from sentinel_bot.metric_models import IncidentRule
 
 MAX_CONFIG_BYTES = 16 * 1024
@@ -167,10 +172,12 @@ class TelegramSettings:
     chat_id: int = field(repr=False)
     allowed_user_ids: frozenset[int] = field(repr=False)
     topic_id: int | None = field(default=None, repr=False)
+    provider: str = "telegram"
 
     @property
     def destination(self) -> str:
-        return f"telegram:{self.chat_id}:{self.topic_id or 0}"
+        channel = "telegram:demo" if self.provider == "demo" else "telegram"
+        return f"{channel}:{self.chat_id}:{self.topic_id or 0}"
 
 
 @dataclass(frozen=True)
@@ -614,13 +621,25 @@ def _server(value: object, mode: str, environ: Mapping[str, str]) -> ServerConfi
 
 
 def _telegram(value: object, environ: Mapping[str, str], mode: str) -> TelegramSettings | None:
-    if not isinstance(value, dict) or set(value) - {"enabled"}:
-        raise ConfigError("Only the enabled flag is supported in [telegram].")
+    if not isinstance(value, dict) or set(value) - {"enabled", "provider"}:
+        raise ConfigError("Unsupported fields in [telegram].")
+    provider = value.get("provider", "telegram")
+    if not isinstance(provider, str) or provider not in {"telegram", "demo"}:
+        raise ConfigError("Telegram provider must be telegram or demo.")
+    if provider == "demo" and mode != "demo":
+        raise ConfigError("The synthetic Telegram provider requires demo mode.")
     enabled = value.get("enabled", False)
     if type(enabled) is not bool:
         raise ConfigError("telegram.enabled must be a boolean.")
     if not enabled:
         return None
+    if provider == "demo":
+        return TelegramSettings(
+            DEMO_TELEGRAM_TOKEN,
+            DEMO_TELEGRAM_CHAT_ID,
+            frozenset({DEMO_TELEGRAM_USER_ID}),
+            provider="demo",
+        )
     if mode == "demo":
         raise ConfigError("The isolated website demo cannot enable live Telegram.")
     token = environ.get("SENTINEL_TELEGRAM_BOT_TOKEN", "")
@@ -979,7 +998,7 @@ def load_settings(path: Path, environ: Mapping[str, str] | None = None) -> Setti
     telegram = _telegram(document.get("telegram", {}), env, mode)
     email = _email(document.get("email", {}), env, mode)
     if ingress is not None:
-        if mode == "demo" or not sources or (telegram is None and email is None):
+        if not sources or (telegram is None and email is None):
             raise ConfigError("Ingress requires configured sources and an enabled delivery route.")
         if (
             ingress.max_pending < 2 * ingress.max_active_incidents
